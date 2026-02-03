@@ -8,8 +8,16 @@ from typing import Optional, Dict, Any
 
 import boto3
 from botocore.config import Config
-from openai import OpenAI
+from openai import OpenAI, AzureOpenAI
 from dotenv import load_dotenv
+
+# Azure Key Vault integration
+try:
+    from azure.identity import DefaultAzureCredential
+    from azure.keyvault.secrets import SecretClient
+    AZURE_KEYVAULT_AVAILABLE = True
+except ImportError:
+    AZURE_KEYVAULT_AVAILABLE = False
 
 from ..core.config import CABConfig, ModelConfig
 from ..core.exceptions import LLMError, InputTooLongError
@@ -46,6 +54,9 @@ class LLMService:
         
         # Initialize OpenAI client cache
         self._openai_clients: Dict[str, OpenAI] = {}
+        
+        # Initialize Azure OpenAI client cache
+        self._azure_openai_clients: Dict[str, AzureOpenAI] = {}
     
     def _get_openai_client(self, api_key_env_var: str) -> OpenAI:
         """Get or create OpenAI client."""
@@ -55,6 +66,60 @@ class LLMService:
                 raise LLMError(f"Missing environment variable: {api_key_env_var}")
             self._openai_clients[api_key_env_var] = OpenAI(api_key=api_key)
         return self._openai_clients[api_key_env_var]
+    
+    def _get_api_key_from_keyvault(self, secret_name: str) -> str:
+        """Retrieve API key from Azure Key Vault."""
+        # Default Key Vault for CodeAssistBench
+        KEYVAULT_URL = "https://abadawikeys.vault.azure.net"
+        
+        if not AZURE_KEYVAULT_AVAILABLE:
+            raise LLMError(
+                "Azure Key Vault SDK not installed. Run: pip install azure-identity azure-keyvault-secrets"
+            )
+        
+        try:
+            credential = DefaultAzureCredential()
+            client = SecretClient(vault_url=KEYVAULT_URL, credential=credential)
+            secret = client.get_secret(secret_name)
+            logger.info(f"Retrieved API key from Key Vault: {KEYVAULT_URL}, secret: {secret_name}")
+            return secret.value
+        except Exception as e:
+            raise LLMError(f"Failed to retrieve secret '{secret_name}' from Key Vault: {e}")
+    
+    def _get_azure_openai_client(self, model_config: ModelConfig) -> AzureOpenAI:
+        """Get or create Azure OpenAI client."""
+        # Default Azure OpenAI endpoint (East US 2 - deepprompteastus2)
+        DEFAULT_AZURE_ENDPOINT = "https://deepprompteastus2.openai.azure.com"
+        # Default Key Vault secret name for GPT-5.2
+        DEFAULT_KEYVAULT_SECRET = "gpt-5-2-api-key"
+        
+        cache_key = f"{model_config.azure_endpoint_env_var}_{model_config.api_key_env_var}"
+        
+        if cache_key not in self._azure_openai_clients:
+            # Try environment variable first, then Key Vault
+            api_key = os.getenv(model_config.api_key_env_var)
+            
+            if not api_key:
+                logger.info(f"Environment variable {model_config.api_key_env_var} not set, trying Key Vault...")
+                api_key = self._get_api_key_from_keyvault(DEFAULT_KEYVAULT_SECRET)
+            
+            # Use environment variable or default endpoint
+            azure_endpoint = os.getenv(model_config.azure_endpoint_env_var, DEFAULT_AZURE_ENDPOINT)
+            
+            # Ensure endpoint has https:// prefix
+            if not azure_endpoint.startswith("https://"):
+                azure_endpoint = f"https://{azure_endpoint}"
+            
+            api_version = os.getenv("AZURE_OPENAI_API_VERSION", model_config.azure_api_version)
+            
+            self._azure_openai_clients[cache_key] = AzureOpenAI(
+                api_key=api_key,
+                api_version=api_version,
+                azure_endpoint=azure_endpoint
+            )
+            logger.info(f"Created Azure OpenAI client for endpoint: {azure_endpoint}")
+        
+        return self._azure_openai_clients[cache_key]
     
     def _is_input_too_long_error(self, error_message: str) -> bool:
         """Check if error indicates input too long."""
@@ -109,6 +174,10 @@ class LLMService:
                     return await self._call_openai_model(
                         user_prompt, system_prompt, model_config
                     )
+                elif model_config.provider == "azure_openai":
+                    return await self._call_azure_openai_model(
+                        user_prompt, system_prompt, model_config
+                    )
                 else:  # bedrock
                     return await self._call_bedrock_model(
                         user_prompt, system_prompt, model_config
@@ -156,6 +225,33 @@ class LLMService:
             model=model_config.model_id,
             messages=messages,
             max_tokens=model_config.max_tokens,
+            temperature=model_config.temperature,
+        )
+        
+        return response.choices[0].message.content
+    
+    async def _call_azure_openai_model(
+        self,
+        user_prompt: str,
+        system_prompt: str,
+        model_config: ModelConfig
+    ) -> str:
+        """Call Azure OpenAI model."""
+        client = self._get_azure_openai_client(model_config)
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        
+        # Use deployment name if specified, otherwise use model_id
+        deployment_name = model_config.azure_deployment_name or model_config.model_id
+        
+        # GPT-5.2 and newer models use max_completion_tokens instead of max_tokens
+        response = client.chat.completions.create(
+            model=deployment_name,
+            messages=messages,
+            max_completion_tokens=model_config.max_tokens,
             temperature=model_config.temperature,
         )
         

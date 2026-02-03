@@ -23,6 +23,10 @@ class ModelConfig:
     provider: str = "bedrock"
     api_key_env_var: Optional[str] = None
     thinking_enabled: bool = False
+    # Azure OpenAI specific fields
+    azure_endpoint_env_var: Optional[str] = None
+    azure_api_version: str = "2024-02-15-preview"
+    azure_deployment_name: Optional[str] = None
 
 
 @dataclass
@@ -177,6 +181,30 @@ class CABConfig:
                 max_tokens=32000,
                 provider="openai",
                 api_key_env_var="OPENAI_API_KEY"
+            ),
+            # Azure OpenAI GPT-5.2 model (East US 2)
+            "gpt-5.2": ModelConfig(
+                name="gpt-5.2",
+                model_id="gpt-5.2",
+                max_tokens=128000,
+                temperature=0.1,
+                provider="azure_openai",
+                api_key_env_var="AZURE_OPENAI_API_KEY",
+                azure_endpoint_env_var="AZURE_OPENAI_ENDPOINT",
+                azure_api_version="2024-02-15-preview",
+                azure_deployment_name="gpt-5.2"
+            ),
+            # Alias for GPT-5.2 without dot
+            "gpt52": ModelConfig(
+                name="gpt52",
+                model_id="gpt-5.2",
+                max_tokens=128000,
+                temperature=0.1,
+                provider="azure_openai",
+                api_key_env_var="AZURE_OPENAI_API_KEY",
+                azure_endpoint_env_var="AZURE_OPENAI_ENDPOINT",
+                azure_api_version="2024-02-15-preview",
+                azure_deployment_name="gpt-5.2"
             )
         }
     
@@ -254,6 +282,10 @@ class CABConfig:
     
     def get_model_config(self, model_name: str) -> ModelConfig:
         """Get model configuration by name."""
+        # FIRST: Check if model exists in configured models (including Azure OpenAI)
+        if model_name in self.models:
+            return self.models[model_name]
+        
         # Check if it's an OpenHands model (full model path or standard naming)
         is_openhands_model = (
             "/" in model_name or 
@@ -291,9 +323,8 @@ class CABConfig:
                 provider="kiro_cli"
             )
         
-        if model_name not in self.models:
-            raise ConfigurationError(f"Unknown model: {model_name}")
-        return self.models[model_name]
+        # Model not found anywhere
+        raise ConfigurationError(f"Unknown model: {model_name}")
     
     def validate(self):
         """Validate configuration."""
@@ -308,6 +339,7 @@ class CABConfig:
         
         bedrock_models = 0
         openai_models = 0
+        azure_openai_models = 0
         
         # Only validate models that will actually be used
         models_to_validate = {
@@ -326,15 +358,31 @@ class CABConfig:
                             errors.append(f"Missing environment variable {model_config.api_key_env_var} for model {name}")
                     else:
                         errors.append(f"OpenAI model {name} missing api_key_env_var configuration")
+            elif model_config.provider == "azure_openai":
+                azure_openai_models += 1
+                # Only check Azure credentials if this model will be used
+                if name in models_to_validate:
+                    if model_config.api_key_env_var:
+                        if not os.getenv(model_config.api_key_env_var):
+                            errors.append(f"Missing environment variable {model_config.api_key_env_var} for Azure model {name}")
+                    else:
+                        errors.append(f"Azure OpenAI model {name} missing api_key_env_var configuration")
+                    if model_config.azure_endpoint_env_var:
+                        if not os.getenv(model_config.azure_endpoint_env_var):
+                            errors.append(f"Missing environment variable {model_config.azure_endpoint_env_var} for Azure model {name}")
+                    else:
+                        errors.append(f"Azure OpenAI model {name} missing azure_endpoint_env_var configuration")
             elif model_config.provider == "bedrock":
                 bedrock_models += 1
             else:
                 warnings.append(f"Unknown provider '{model_config.provider}' for model {name}")
         
-        if bedrock_models == 0 and openai_models == 0:
+        if bedrock_models == 0 and openai_models == 0 and azure_openai_models == 0:
             errors.append("No valid models configured")
         elif bedrock_models == 0 and openai_models > 0:
             warnings.append("Only OpenAI models configured - ensure GPT_TOKEN environment variable is set")
+        elif azure_openai_models > 0:
+            warnings.append("Azure OpenAI models configured - ensure AZURE_OPENAI_* environment variables are set")
         
         for default_model in [self.default_maintainer_model, self.default_user_model, self.default_judge_model]:
             if default_model not in self.models:
@@ -352,7 +400,7 @@ class CABConfig:
         if errors:
             raise ConfigurationError(f"Configuration validation failed: {'; '.join(errors)}")
         
-        logger.info(f"Configuration validation passed - {bedrock_models} Bedrock models, {openai_models} OpenAI models configured")
+        logger.info(f"Configuration validation passed - {bedrock_models} Bedrock models, {openai_models} OpenAI models, {azure_openai_models} Azure OpenAI models configured")
         if warnings:
             logger.info(f"Configuration warnings: {len(warnings)} warnings logged")
         return True
