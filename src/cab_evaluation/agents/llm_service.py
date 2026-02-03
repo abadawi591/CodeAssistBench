@@ -6,9 +6,10 @@ import time
 import logging
 from typing import Optional, Dict, Any
 
+import asyncio
 import boto3
 from botocore.config import Config
-from openai import OpenAI, AzureOpenAI
+from openai import OpenAI, AzureOpenAI, AsyncAzureOpenAI
 from dotenv import load_dotenv
 
 # Azure Key Vault integration
@@ -18,6 +19,9 @@ try:
     AZURE_KEYVAULT_AVAILABLE = True
 except ImportError:
     AZURE_KEYVAULT_AVAILABLE = False
+
+# Azure Endpoint Router for multi-endpoint load balancing
+from .azure_endpoint_router import get_router, AzureEndpointRouter
 
 from ..core.config import CABConfig, ModelConfig
 from ..core.exceptions import LLMError, InputTooLongError
@@ -29,13 +33,15 @@ logger = logging.getLogger(__name__)
 class LLMService:
     """Service for managing LLM model interactions."""
     
-    def __init__(self, config: CABConfig):
+    def __init__(self, config: CABConfig, use_azure_router: bool = True):
         """Initialize LLM service.
         
         Args:
             config: CAB configuration
+            use_azure_router: Whether to use the multi-endpoint Azure router (default: True)
         """
         self.config = config
+        self.use_azure_router = use_azure_router
         
         # Setup AWS Bedrock client
         bedrock_config = Config(
@@ -55,8 +61,20 @@ class LLMService:
         # Initialize OpenAI client cache
         self._openai_clients: Dict[str, OpenAI] = {}
         
-        # Initialize Azure OpenAI client cache
-        self._azure_openai_clients: Dict[str, AzureOpenAI] = {}
+        # Initialize Azure OpenAI client cache (async for parallel processing)
+        self._azure_openai_clients: Dict[str, AsyncAzureOpenAI] = {}
+        
+        # Initialize Azure Endpoint Router for multi-endpoint load balancing
+        self._azure_router: Optional[AzureEndpointRouter] = None
+        if self.use_azure_router:
+            try:
+                self._azure_router = get_router()
+                capacity = self._azure_router.get_total_capacity()
+                logger.info(f"Azure Endpoint Router enabled: {len(self._azure_router.endpoints)} endpoints, "
+                           f"{capacity['rpm']:,} RPM, {capacity['tpm']:,} TPM")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Azure Router, falling back to single endpoint: {e}")
+                self._azure_router = None
     
     def _get_openai_client(self, api_key_env_var: str) -> OpenAI:
         """Get or create OpenAI client."""
@@ -86,8 +104,8 @@ class LLMService:
         except Exception as e:
             raise LLMError(f"Failed to retrieve secret '{secret_name}' from Key Vault: {e}")
     
-    def _get_azure_openai_client(self, model_config: ModelConfig) -> AzureOpenAI:
-        """Get or create Azure OpenAI client."""
+    def _get_azure_openai_client(self, model_config: ModelConfig) -> AsyncAzureOpenAI:
+        """Get or create async Azure OpenAI client for parallel processing."""
         # Default Azure OpenAI endpoint (East US 2 - deepprompteastus2)
         DEFAULT_AZURE_ENDPOINT = "https://deepprompteastus2.openai.azure.com"
         # Default Key Vault secret name for GPT-5.2
@@ -112,12 +130,13 @@ class LLMService:
             
             api_version = os.getenv("AZURE_OPENAI_API_VERSION", model_config.azure_api_version)
             
-            self._azure_openai_clients[cache_key] = AzureOpenAI(
+            # Use AsyncAzureOpenAI for true async/parallel processing
+            self._azure_openai_clients[cache_key] = AsyncAzureOpenAI(
                 api_key=api_key,
                 api_version=api_version,
                 azure_endpoint=azure_endpoint
             )
-            logger.info(f"Created Azure OpenAI client for endpoint: {azure_endpoint}")
+            logger.info(f"Created async Azure OpenAI client for endpoint: {azure_endpoint}")
         
         return self._azure_openai_clients[cache_key]
     
@@ -198,7 +217,7 @@ class LLMService:
                         f"LLM call failed (attempt {retry_count}/{max_retries}). "
                         f"Retrying in {wait_time:.2f} seconds. Error: {error_str}"
                     )
-                    time.sleep(wait_time)
+                    await asyncio.sleep(wait_time)  # Non-blocking sleep for async
                 else:
                     logger.error(f"LLM call failed after {max_retries} retries: {error_str}")
                     raise LLMError(
@@ -236,19 +255,29 @@ class LLMService:
         system_prompt: str,
         model_config: ModelConfig
     ) -> str:
-        """Call Azure OpenAI model."""
-        client = self._get_azure_openai_client(model_config)
-        
+        """Call Azure OpenAI model with multi-endpoint routing and failover."""
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
         
+        # Use the multi-endpoint router if available (default)
+        if self._azure_router is not None:
+            return await self._azure_router.call_with_retry(
+                messages=messages,
+                max_completion_tokens=model_config.max_tokens,
+                temperature=model_config.temperature,
+            )
+        
+        # Fallback to single endpoint if router not available
+        client = self._get_azure_openai_client(model_config)
+        
         # Use deployment name if specified, otherwise use model_id
         deployment_name = model_config.azure_deployment_name or model_config.model_id
         
         # GPT-5.2 and newer models use max_completion_tokens instead of max_tokens
-        response = client.chat.completions.create(
+        # Using await for true async execution
+        response = await client.chat.completions.create(
             model=deployment_name,
             messages=messages,
             max_completion_tokens=model_config.max_tokens,
@@ -323,3 +352,9 @@ class LLMService:
             return raw_response.strip()
         else:  # DeepSeek format
             return response_body["choices"][0]["message"]["content"]
+    
+    def get_azure_router_stats(self) -> Optional[Dict[str, Any]]:
+        """Get statistics from the Azure endpoint router."""
+        if self._azure_router:
+            return self._azure_router.get_stats()
+        return None

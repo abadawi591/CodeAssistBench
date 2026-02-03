@@ -4,6 +4,7 @@ import os
 import logging
 from datetime import datetime
 from typing import Optional, Dict, Any, List
+from tqdm import tqdm
 
 from ..core.models import (
     IssueData,
@@ -168,7 +169,21 @@ class CABWorkflow:
         successful_count = 0
         error_count = 0
         
-        for i, issue_data in enumerate(issues_to_process):
+        # Progress bar for issue processing
+        pbar = tqdm(
+            enumerate(issues_to_process),
+            total=len(issues_to_process),
+            desc="Processing issues",
+            unit="issue",
+            ncols=100,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+        )
+        
+        for i, issue_data in pbar:
+            # Update progress bar description with current issue
+            short_title = issue_data.first_question.title[:40] + "..." if len(issue_data.first_question.title) > 40 else issue_data.first_question.title
+            pbar.set_postfix_str(f"✓{successful_count} ✗{error_count} | {short_title}")
+            
             logger.info(f"\n{'='*80}")
             logger.info(f"📋 Processing issue {i+1}/{len(issues_to_process)}: {issue_data.first_question.title}")
             logger.info(f"{'='*80}")

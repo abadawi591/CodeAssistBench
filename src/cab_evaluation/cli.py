@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from tqdm import tqdm
+
 from .core.config import CABConfig
 from .utils.data_processor import DataProcessor
 from .workflows.cab_workflow import CABWorkflow
@@ -196,19 +198,41 @@ async def run_generation_dataset(args):
     # Process issues and write results to JSONL
     try:
         from .workflows.generation_workflow import GenerationWorkflow
+        import threading
         
         generation_workflow = GenerationWorkflow(config)
         successful_count = 0
         failed_count = 0
         
+        # Concurrency settings
+        concurrency = getattr(args, 'concurrency', 1)
+        semaphore = asyncio.Semaphore(concurrency)
+        write_lock = threading.Lock()
+        
+        logger.info(f"🚀 Processing with concurrency: {concurrency}")
+        
         # Open output file for appending (for resume functionality)
         mode = 'a' if (args.resume and Path(args.output).exists()) else 'w'
-        with open(args.output, mode) as f:
-            for i, issue_data in enumerate(issues_to_process):
-                logger.info(f"Processing issue {i+1}/{len(issues_to_process)}: {issue_data.id} - {issue_data.first_question.title}")
-                
+        output_file = open(args.output, mode)
+        
+        # Progress bar
+        pbar = tqdm(
+            total=len(issues_to_process),
+            desc=f"Generation (×{concurrency})",
+            unit="issue",
+            ncols=120,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+        )
+        
+        async def process_single_issue(issue_data, issue_index):
+            """Process a single issue with semaphore for concurrency control."""
+            nonlocal successful_count, failed_count
+            
+            async with semaphore:
                 try:
-                    # Run generation workflow with framework mapping
+                    logger.info(f"Processing issue {issue_index+1}/{len(issues_to_process)}: {issue_data.id}")
+                    
+                    # Run generation workflow
                     result = await generation_workflow.run_generation(
                         issue_data, 
                         agent_model_mapping, 
@@ -216,16 +240,15 @@ async def run_generation_dataset(args):
                         enable_ast_tools=not getattr(args, 'disable_ast_tools', False)
                     )
                     
-                    # Get original issue data for complete metadata preservation
+                    # Get original issue data
                     original_issue = None
                     for orig_item in raw_data:
                         if str(orig_item.get('number')) == str(result.issue_data.id):
                             original_issue = orig_item
                             break
                     
-                    # Convert to dictionary with complete metadata including all original fields
+                    # Convert to dictionary
                     result_dict = {
-                        # Core result data
                         'issue_id': result.issue_data.id,
                         'question_title': result.issue_data.first_question.title,
                         'question_body': result.issue_data.first_question.body,
@@ -240,20 +263,14 @@ async def run_generation_dataset(args):
                         'total_conversation_rounds': result.total_conversation_rounds,
                         'original_comment_count': result.original_comment_count,
                         'conversation_history': [
-                            {
-                                'role': msg.role,
-                                'content': msg.content
-                            }
+                            {'role': msg.role, 'content': msg.content}
                             for msg in result.conversation_history
                         ],
                         'exploration_history': result.exploration_history,
                         'exploration_log': result.exploration_log,
                         'llm_call_counter': result.llm_call_counter,
                         'prompt_cache': result.prompt_cache,
-                        
-                        # Original input metadata preservation - ALL fields from input JSONL
                         'original_metadata': original_issue if original_issue else {},
-                        
                         'processing_metadata': {
                             'workflow': 'generation_only',
                             'timestamp': datetime.now().isoformat(),
@@ -264,24 +281,31 @@ async def run_generation_dataset(args):
                         }
                     }
                     
-                    # Write result as JSONL line
-                    f.write(json.dumps(result_dict, default=str) + '\n')
-                    f.flush()  # Ensure immediate write for progress tracking
+                    # Thread-safe write
+                    with write_lock:
+                        output_file.write(json.dumps(result_dict, default=str) + '\n')
+                        output_file.flush()
+                        successful_count += 1
+                        pbar.update(1)
+                        pbar.set_postfix_str(f"✓{successful_count} ✗{failed_count}")
                     
-                    successful_count += 1
                     logger.info(f"✅ Issue {issue_data.id} processed successfully")
+                    return result_dict
                     
                 except Exception as e:
                     logger.error(f"❌ Error processing issue {issue_data.id}: {e}")
+                    with write_lock:
+                        failed_count += 1
+                        pbar.update(1)
+                        pbar.set_postfix_str(f"✓{successful_count} ✗{failed_count}")
                     
-                    # Get original issue data for complete metadata preservation in error case
+                    # Write error result
                     original_issue = None
                     for orig_item in raw_data:
                         if str(orig_item.get('number')) == str(issue_data.id):
                             original_issue = orig_item
                             break
                     
-                    # Write error result to maintain JSONL consistency with complete metadata
                     error_result = {
                         'issue_id': issue_data.id,
                         'question_title': issue_data.first_question.title,
@@ -295,10 +319,7 @@ async def run_generation_dataset(args):
                         'satisfaction_status': 'ERROR',
                         'satisfaction_reason': f'Processing failed: {str(e)}',
                         'total_conversation_rounds': 0,
-                        
-                        # Original input metadata preservation for error cases too - ALL fields
                         'original_metadata': original_issue if original_issue else {},
-                        
                         'processing_metadata': {
                             'workflow': 'generation_only',
                             'timestamp': datetime.now().isoformat(),
@@ -307,10 +328,24 @@ async def run_generation_dataset(args):
                             'input_file': args.dataset_file
                         }
                     }
-                    f.write(json.dumps(error_result, default=str) + '\n')
-                    f.flush()
+                    with write_lock:
+                        output_file.write(json.dumps(error_result, default=str) + '\n')
+                        output_file.flush()
                     
-                    failed_count += 1
+                    return error_result
+        
+        # Create tasks for all issues and run concurrently
+        tasks = [
+            process_single_issue(issue_data, i) 
+            for i, issue_data in enumerate(issues_to_process)
+        ]
+        
+        # Run all tasks with controlled concurrency (via semaphore)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Clean up
+        pbar.close()
+        output_file.close()
         
         # Log final summary
         logger.info(f"=== GENERATION DATASET PROCESSING COMPLETE ===")
@@ -412,8 +447,21 @@ async def run_evaluation_dataset(args):
         # Open output file for appending (for resume functionality)
         mode = 'a' if (args.resume and Path(args.output).exists()) else 'w'
         with open(args.output, mode) as f:
-            for i, generation_dict in enumerate(results_to_process):
+            # Progress bar for evaluation
+            pbar = tqdm(
+                enumerate(results_to_process),
+                total=len(results_to_process),
+                desc="Evaluation",
+                unit="issue",
+                ncols=120,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+            )
+            
+            for i, generation_dict in pbar:
                 issue_id = generation_dict.get('issue_id', f'unknown_{i}')
+                short_title = generation_dict.get('question_title', 'Unknown')[:35]
+                pbar.set_postfix_str(f"✓{successful_count} ✗{failed_count} | {short_title}...")
+                
                 logger.info(f"Evaluating {i+1}/{len(results_to_process)}: {issue_id} - {generation_dict.get('question_title', 'Unknown')}")
                 
                 try:
@@ -781,6 +829,12 @@ def main():
         "--disable-ast-tools",
         action="store_true",
         help="Disable AST tools (read_code, edit_code) for OpenHands maintainer agent"
+    )
+    generation_dataset_parser.add_argument(
+        "--concurrency", "-c",
+        type=int,
+        default=1,
+        help="Number of issues to process concurrently (default: 1, recommended: 4-8 with multi-endpoint router)"
     )
     
     # Evaluation dataset command for JSONL files with generation results

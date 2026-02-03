@@ -20,19 +20,93 @@ This guide documents the end-to-end pipeline for running CodeAssistBench evaluat
 │   └──────────────┘     └──────────────┘     └──────────────┘                │
 │                               │                    │                         │
 │                               ▼                    ▼                         │
-│                        ┌─────────────────────────────────┐                  │
-│                        │      Azure OpenAI GPT-5.2       │                  │
-│                        │  deepprompteastus2.openai.azure │                  │
-│                        └─────────────────────────────────┘                  │
+│                  ┌───────────────────────────────────────────┐              │
+│                  │       Azure OpenAI Endpoint Router        │              │
+│                  │  ┌─────────┬─────────┬─────────┬────────┐ │              │
+│                  │  │East US 2│South    │Sweden   │East US │ │              │
+│                  │  │(Primary)│Central  │Central  │2 (#4)  │ │              │
+│                  │  │10K RPM  │10K RPM  │8.5K RPM │2K RPM  │ │              │
+│                  │  └─────────┴─────────┴─────────┴────────┘ │              │
+│                  │         Total: 30,500 RPM                 │              │
+│                  └───────────────────────────────────────────┘              │
 │                                       │                                      │
 │                                       ▼                                      │
 │                        ┌─────────────────────────────────┐                  │
 │                        │      Azure Key Vault            │                  │
 │                        │       (abadawikeys)             │                  │
-│                        │    Secret: gpt-5-2-api-key      │                  │
+│                        │    4 API Key Secrets            │                  │
 │                        └─────────────────────────────────┘                  │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Multi-Endpoint Router
+
+The pipeline uses an intelligent endpoint router that distributes requests across 4 Azure OpenAI deployments for maximum throughput and reliability.
+
+### Endpoint Configuration
+
+| Region           | Endpoint                                  | Deployment  | RPM    | TPM       | Priority |
+|------------------|-------------------------------------------|-------------|--------|-----------|----------|
+| East US 2        | deepprompteastus2.openai.azure.com        | gpt-5.2     | 10,000 | 1,000,000 | 1        |
+| South Central US | deeppromptsouthcentralus.openai.azure.com | gpt-5.2_2   | 10,000 | 1,000,000 | 2        |
+| Sweden Central   | deeppromptswedencentral.openai.azure.com  | gpt-5.2     | 8,500  | 850,000   | 3        |
+| East US 2 (#4)   | deepprompteastus2.openai.azure.com        | gpt-5.2-4   | 2,000  | 200,000   | 4        |
+| **TOTAL**        |                                           |             | **30,500** | **3,050,000** |    |
+
+### Router Features
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Endpoint Router Architecture                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   ┌─────────────────┐                                                       │
+│   │  API Request    │                                                       │
+│   └────────┬────────┘                                                       │
+│            │                                                                 │
+│            ▼                                                                 │
+│   ┌─────────────────────────────────────────────────────────────┐           │
+│   │              WEIGHTED LOAD BALANCER                          │           │
+│   │  ┌─────────────────────────────────────────────────────┐    │           │
+│   │  │ • Priority-based routing (lower = higher priority)  │    │           │
+│   │  │ • Capacity-weighted selection (RPM-based)           │    │           │
+│   │  │ • Health-aware (avoid unhealthy endpoints)          │    │           │
+│   │  └─────────────────────────────────────────────────────┘    │           │
+│   └─────────────────────┬───────────────────────────────────────┘           │
+│                         │                                                    │
+│         ┌───────────────┼───────────────┬───────────────┐                   │
+│         ▼               ▼               ▼               ▼                   │
+│   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐                │
+│   │ Endpoint │   │ Endpoint │   │ Endpoint │   │ Endpoint │                │
+│   │    1     │   │    2     │   │    3     │   │    4     │                │
+│   │ (33%)    │   │ (33%)    │   │ (28%)    │   │ (6%)     │                │
+│   └──────────┘   └──────────┘   └──────────┘   └──────────┘                │
+│         │               │               │               │                   │
+│         └───────────────┴───────┬───────┴───────────────┘                   │
+│                                 │                                            │
+│                                 ▼                                            │
+│   ┌─────────────────────────────────────────────────────────────┐           │
+│   │                    FAILOVER LOGIC                            │           │
+│   │  ┌─────────────────────────────────────────────────────┐    │           │
+│   │  │ If endpoint fails:                                   │    │           │
+│   │  │   1. Mark endpoint as degraded/unhealthy            │    │           │
+│   │  │   2. Retry on next best endpoint                    │    │           │
+│   │  │   3. Up to 4 attempts (one per endpoint)            │    │           │
+│   │  │   4. Tenacity retry with exponential backoff        │    │           │
+│   │  └─────────────────────────────────────────────────────┘    │           │
+│   └─────────────────────────────────────────────────────────────┘           │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Testing the Router
+
+```bash
+# Test router initialization and API connectivity
+python test_azure_router.py
 ```
 
 ---
