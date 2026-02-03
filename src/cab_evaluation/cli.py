@@ -4,14 +4,20 @@ import asyncio
 import argparse
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from tqdm import tqdm
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, TimeElapsedColumn
+from rich.live import Live
+from rich.console import Group
+from rich.panel import Panel
 
 from .core.config import CABConfig
 from .utils.data_processor import DataProcessor
+from .utils.rich_logger import CABLogger, get_cab_logger, console
 from .workflows.cab_workflow import CABWorkflow
 
 
@@ -203,34 +209,60 @@ async def run_generation_dataset(args):
         generation_workflow = GenerationWorkflow(config)
         successful_count = 0
         failed_count = 0
+        start_time = time.time()
         
         # Concurrency settings
         concurrency = getattr(args, 'concurrency', 1)
         semaphore = asyncio.Semaphore(concurrency)
         write_lock = threading.Lock()
         
-        logger.info(f"🚀 Processing with concurrency: {concurrency}")
+        # Initialize rich logger
+        log_file_path = str(Path(args.output).parent / f"generation_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        cab_logger = get_cab_logger(log_file_path)
+        cab_logger.info(f"Starting generation with concurrency: {concurrency}")
+        cab_logger.info(f"Output file: {args.output}")
+        cab_logger.info(f"Log file: {log_file_path}")
         
         # Open output file for appending (for resume functionality)
         mode = 'a' if (args.resume and Path(args.output).exists()) else 'w'
         output_file = open(args.output, mode)
         
-        # Progress bar
-        pbar = tqdm(
-            total=len(issues_to_process),
-            desc=f"Generation (×{concurrency})",
-            unit="issue",
-            ncols=120,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+        # Rich progress bar - stays visible at top
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn(f"[bold cyan]Generation (×{concurrency})[/bold cyan]"),
+            BarColumn(bar_width=40),
+            TaskProgressColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            TextColumn("[green]✓{task.fields[success]}[/green] [red]✗{task.fields[failed]}[/red]"),
+            console=console,
+            expand=False,
         )
+        
+        # Start progress display
+        progress.start()
+        task_id = progress.add_task("processing", total=len(issues_to_process), success=0, failed=0)
         
         async def process_single_issue(issue_data, issue_index):
             """Process a single issue with semaphore for concurrency control."""
             nonlocal successful_count, failed_count
             
             async with semaphore:
+                issue_start_time = time.time()
+                
                 try:
-                    logger.info(f"Processing issue {issue_index+1}/{len(issues_to_process)}: {issue_data.id}")
+                    # Log issue start with rich formatting
+                    cab_logger.issue_start(
+                        issue_id=str(issue_data.id),
+                        title=issue_data.first_question.title,
+                        language=issue_data.language,
+                        repository=issue_data.commit_info.repository,
+                        issue_number=issue_index + 1,
+                        total_issues=len(issues_to_process)
+                    )
                     
                     # Run generation workflow
                     result = await generation_workflow.run_generation(
@@ -286,18 +318,27 @@ async def run_generation_dataset(args):
                         output_file.write(json.dumps(result_dict, default=str) + '\n')
                         output_file.flush()
                         successful_count += 1
-                        pbar.update(1)
-                        pbar.set_postfix_str(f"✓{successful_count} ✗{failed_count}")
+                        progress.update(task_id, advance=1, success=successful_count, failed=failed_count)
                     
-                    logger.info(f"✅ Issue {issue_data.id} processed successfully")
+                    # Log issue completion with rich formatting
+                    issue_duration = time.time() - issue_start_time
+                    cab_logger.issue_complete(
+                        issue_id=str(issue_data.id),
+                        success=True,
+                        satisfaction_status=result.satisfaction_status.value,
+                        total_turns=result.total_conversation_rounds,
+                        duration_seconds=issue_duration
+                    )
+                    
                     return result_dict
                     
                 except Exception as e:
-                    logger.error(f"❌ Error processing issue {issue_data.id}: {e}")
+                    # Log error with rich formatting
+                    cab_logger.error(str(e), issue_id=str(issue_data.id))
+                    
                     with write_lock:
                         failed_count += 1
-                        pbar.update(1)
-                        pbar.set_postfix_str(f"✓{successful_count} ✗{failed_count}")
+                        progress.update(task_id, advance=1, success=successful_count, failed=failed_count)
                     
                     # Write error result
                     original_issue = None
@@ -344,15 +385,22 @@ async def run_generation_dataset(args):
         await asyncio.gather(*tasks, return_exceptions=True)
         
         # Clean up
-        pbar.close()
+        progress.stop()
         output_file.close()
         
-        # Log final summary
-        logger.info(f"=== GENERATION DATASET PROCESSING COMPLETE ===")
-        logger.info(f"Total issues processed: {len(issues_to_process)}")
-        logger.info(f"Successful: {successful_count}")
-        logger.info(f"Failed: {failed_count}")
-        logger.info(f"Results saved to: {args.output}")
+        # Calculate total duration
+        total_duration = time.time() - start_time
+        
+        # Log final summary with rich formatting
+        cab_logger.summary(
+            total_issues=len(issues_to_process),
+            successful=successful_count,
+            failed=failed_count,
+            total_duration=total_duration
+        )
+        
+        cab_logger.info(f"Results saved to: {args.output}")
+        cab_logger.info(f"Log saved to: {log_file_path}")
         
         return 0
         
