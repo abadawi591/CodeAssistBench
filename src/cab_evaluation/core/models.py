@@ -11,6 +11,7 @@ class SatisfactionStatus(str, Enum):
     FULLY_SATISFIED = "FULLY_SATISFIED"
     PARTIALLY_SATISFIED = "PARTIALLY_SATISFIED"
     NOT_SATISFIED = "NOT_SATISFIED"
+    AGENT_ERROR = "AGENT_ERROR"  # Agent crashed/corrupted during conversation
 
 
 class VerdictType(str, Enum):

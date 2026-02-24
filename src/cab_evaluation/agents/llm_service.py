@@ -70,8 +70,8 @@ class LLMService:
             try:
                 self._azure_router = get_router()
                 capacity = self._azure_router.get_total_capacity()
-                logger.info(f"Azure Endpoint Router enabled: {len(self._azure_router.endpoints)} endpoints, "
-                           f"{capacity['rpm']:,} RPM, {capacity['tpm']:,} TPM")
+                logger.debug(f"Azure Router: {len(self._azure_router.endpoints)} endpoints, "
+                            f"{capacity['rpm']:,} RPM")
             except Exception as e:
                 logger.warning(f"Failed to initialize Azure Router, falling back to single endpoint: {e}")
                 self._azure_router = None
@@ -99,7 +99,7 @@ class LLMService:
             credential = DefaultAzureCredential()
             client = SecretClient(vault_url=KEYVAULT_URL, credential=credential)
             secret = client.get_secret(secret_name)
-            logger.info(f"Retrieved API key from Key Vault: {KEYVAULT_URL}, secret: {secret_name}")
+            logger.debug(f"Retrieved API key from Key Vault: {secret_name}")
             return secret.value
         except Exception as e:
             raise LLMError(f"Failed to retrieve secret '{secret_name}' from Key Vault: {e}")
@@ -118,7 +118,7 @@ class LLMService:
             api_key = os.getenv(model_config.api_key_env_var)
             
             if not api_key:
-                logger.info(f"Environment variable {model_config.api_key_env_var} not set, trying Key Vault...")
+                logger.debug(f"Env var {model_config.api_key_env_var} not set, using Key Vault")
                 api_key = self._get_api_key_from_keyvault(DEFAULT_KEYVAULT_SECRET)
             
             # Use environment variable or default endpoint
@@ -136,7 +136,7 @@ class LLMService:
                 api_version=api_version,
                 azure_endpoint=azure_endpoint
             )
-            logger.info(f"Created async Azure OpenAI client for endpoint: {azure_endpoint}")
+            logger.debug(f"Created Azure client: {azure_endpoint}")
         
         return self._azure_openai_clients[cache_key]
     
@@ -204,19 +204,33 @@ class LLMService:
                     
             except Exception as e:
                 error_str = str(e)
+                error_lower = error_str.lower()
                 
                 # Check for input too long errors
                 if self._is_input_too_long_error(error_str):
                     logger.warning(f"Input size error: {error_str}")
                     raise InputTooLongError(error_str)
                 
+                # Check for rate limit errors - use longer waits with exponential backoff
+                is_rate_limit = any(term in error_lower for term in [
+                    "429", "rate limit", "ratelimit", "throttl", "too many requests", "quota", "capacity"
+                ])
+                
                 retry_count += 1
                 if retry_count <= max_retries:
-                    wait_time = 10
-                    logger.warning(
-                        f"LLM call failed (attempt {retry_count}/{max_retries}). "
-                        f"Retrying in {wait_time:.2f} seconds. Error: {error_str}"
-                    )
+                    # Use exponential backoff for rate limits, shorter for other errors
+                    import random
+                    if is_rate_limit:
+                        # Exponential backoff: 30s, 45s, 67s, 100s, 120s (capped)
+                        base_wait = 30
+                        wait_time = min(base_wait * (1.5 ** min(retry_count - 1, 4)) + random.uniform(0, 15), 120)
+                        logger.warning(f"Rate limited (429). Retry {retry_count}/{max_retries} in {wait_time:.0f}s...")
+                    else:
+                        wait_time = 10 + random.uniform(0, 5)
+                        logger.warning(
+                            f"LLM call failed (attempt {retry_count}/{max_retries}). "
+                            f"Retrying in {wait_time:.1f}s. Error: {error_str[:200]}"
+                        )
                     await asyncio.sleep(wait_time)  # Non-blocking sleep for async
                 else:
                     logger.error(f"LLM call failed after {max_retries} retries: {error_str}")
@@ -240,13 +254,27 @@ class LLMService:
             {"role": "user", "content": user_prompt},
         ]
         
-        response = client.chat.completions.create(
-            model=model_config.model_id,
-            messages=messages,
-            max_tokens=model_config.max_tokens,
-            temperature=model_config.temperature,
-        )
-        
+        # Reasoning models (e.g. o1*) reject `max_tokens` and also don't support `temperature`.
+        model_id = (model_config.model_id or "").lower()
+        is_o1 = model_id == "o1" or model_id.startswith("o1-")
+        is_gpt5 = model_id == "gpt-5" or model_id.startswith("gpt-5-")
+        is_reasoning_model = is_gpt5 or is_o1
+
+        if is_reasoning_model:
+            response = client.chat.completions.create(
+                model=model_config.model_id,
+                messages=messages,
+                max_completion_tokens=model_config.max_tokens,
+                reasoning_effort="low",
+            )
+        else:
+            response = client.chat.completions.create(
+                model=model_config.model_id,
+                messages=messages,
+                max_tokens=model_config.max_tokens,
+                temperature=model_config.temperature,
+            )
+
         return response.choices[0].message.content
     
     async def _call_azure_openai_model(
@@ -261,13 +289,27 @@ class LLMService:
             {"role": "user", "content": user_prompt},
         ]
         
+        # Check if this is a reasoning model that doesn't support temperature
+        model_id = (model_config.model_id or "").lower()
+        is_o1 = model_id == "o1" or model_id.startswith("o1-")
+        is_gpt5 = model_id == "gpt-5" or model_id.startswith("gpt-5-")
+        is_reasoning_model = is_gpt5 or is_o1
+        
         # Use the multi-endpoint router if available (default)
         if self._azure_router is not None:
-            return await self._azure_router.call_with_retry(
-                messages=messages,
-                max_completion_tokens=model_config.max_tokens,
-                temperature=model_config.temperature,
-            )
+            if is_reasoning_model:
+                # Reasoning models don't support temperature parameter
+                return await self._azure_router.call_with_retry(
+                    messages=messages,
+                    max_completion_tokens=model_config.max_tokens,
+                    reasoning_effort="low",
+                )
+            else:
+                return await self._azure_router.call_with_retry(
+                    messages=messages,
+                    max_completion_tokens=model_config.max_tokens,
+                    temperature=model_config.temperature,
+                )
         
         # Fallback to single endpoint if router not available
         client = self._get_azure_openai_client(model_config)
@@ -277,12 +319,21 @@ class LLMService:
         
         # GPT-5.2 and newer models use max_completion_tokens instead of max_tokens
         # Using await for true async execution
-        response = await client.chat.completions.create(
-            model=deployment_name,
-            messages=messages,
-            max_completion_tokens=model_config.max_tokens,
-            temperature=model_config.temperature,
-        )
+        if is_reasoning_model:
+            # Reasoning models don't support temperature, use reasoning_effort instead
+            response = await client.chat.completions.create(
+                model=deployment_name,
+                messages=messages,
+                max_completion_tokens=model_config.max_tokens,
+                reasoning_effort="low",
+            )
+        else:
+            response = await client.chat.completions.create(
+                model=deployment_name,
+                messages=messages,
+                max_completion_tokens=model_config.max_tokens,
+                temperature=model_config.temperature,
+            )
         
         return response.choices[0].message.content
     

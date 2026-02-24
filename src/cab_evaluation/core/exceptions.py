@@ -42,6 +42,18 @@ class AgentError(CABEvaluationError):
         super().__init__(message, "AGENT_ERROR")
 
 
+class AgentCorruptedError(AgentError):
+    """Exception raised when agent state is corrupted and unrecoverable.
+    
+    This typically happens with Strands agents when tool call history
+    gets corrupted (tool call without matching response).
+    """
+    
+    def __init__(self, message: str = "Agent state corrupted", agent_type: str = None):
+        super().__init__(message, agent_type)
+        self.error_code = "AGENT_CORRUPTED"
+
+
 class RepositoryError(CABEvaluationError):
     """Exception raised when repository operations fail."""
     

@@ -182,12 +182,20 @@ class CABConfig:
                 provider="openai",
                 api_key_env_var="OPENAI_API_KEY"
             ),
+            "o1": ModelConfig(
+                name="o1",
+                model_id="o1",
+                max_tokens=32000,
+                provider="openai",
+                api_key_env_var="OPENAI_API_KEY",
+            ),
             # Azure OpenAI GPT-5.2 model (East US 2)
+            # Note: GPT-5.2 is a reasoning model that only supports temperature=1.0
             "gpt-5.2": ModelConfig(
                 name="gpt-5.2",
                 model_id="gpt-5.2",
                 max_tokens=128000,
-                temperature=0.1,
+                temperature=1.0,  # GPT-5.2 reasoning models only support default temperature
                 provider="azure_openai",
                 api_key_env_var="AZURE_OPENAI_API_KEY",
                 azure_endpoint_env_var="AZURE_OPENAI_ENDPOINT",
@@ -199,7 +207,7 @@ class CABConfig:
                 name="gpt52",
                 model_id="gpt-5.2",
                 max_tokens=128000,
-                temperature=0.1,
+                temperature=1.0,  # GPT-5.2 reasoning models only support default temperature
                 provider="azure_openai",
                 api_key_env_var="AZURE_OPENAI_API_KEY",
                 azure_endpoint_env_var="AZURE_OPENAI_ENDPOINT",

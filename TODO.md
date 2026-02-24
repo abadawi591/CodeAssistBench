@@ -172,12 +172,53 @@ The code automatically retrieves the API key from Azure Key Vault:
 
 Just run `az login` and the code will fetch the key automatically.
 
+## Phase 7: Strands Analysis & Tool Agent ✅ COMPLETE
+
+### Analysis Completed
+- [x] Analyzed original Strands framework tools
+- [x] Documented all tools: fs_read, execute_bash, fs_write, thinking, report_issue, use_aws
+- [x] Compared with Tool Agent implementation
+- [x] Identified discrepancies and gaps
+- [x] Applied critical fixes
+
+### Strands vs Tool Agent Comparison
+
+| Feature | Strands | Tool Agent | Status |
+|---------|---------|------------|--------|
+| File reading (basic) | ✅ | ✅ | Parity |
+| File reading (search mode) | ✅ | ✅ | **Fixed** |
+| Bash execution | Unrestricted | Expanded whitelist | **Fixed** |
+| Bash with cwd | ✅ | ✅ | **Fixed** |
+| Thinking | Multi-cycle + nested | Structured stages | Partial |
+| File writing | ✅ | ❌ (read-only) | Expected |
+| AWS integration | ✅ | ❌ | Not needed |
+
+### Critical Fixes Applied
+
+1. **Expanded Command Whitelist** - Added git, python, node, npm, curl, jq, make, etc.
+2. **Added cwd Parameter** - execute_bash now supports subdirectory navigation
+3. **Added Search Mode** - fs_read now supports pattern search with context lines
+4. **Improved Thinking** - Added stage parameter (initial/analysis/synthesis/conclusion)
+
+### Documentation Created
+- `docs/STRANDS_ANALYSIS.md` - Comprehensive comparison of Strands vs Tool Agent
+
 ## FILES MODIFIED
 
 | File | Changes |
 |------|---------|
 | `src/cab_evaluation/core/config.py` | Added Azure-specific fields to ModelConfig, added gpt-5.2 and gpt52 models, updated validation |
 | `src/cab_evaluation/agents/llm_service.py` | Added AzureOpenAI import, Key Vault integration, _get_azure_openai_client(), _call_azure_openai_model() |
-| `requirements.txt` | Added azure-identity, azure-keyvault-secrets packages |
-| `test_azure_config.py` | NEW - Test script for Azure configuration with Key Vault support |
-| `TODO.md` | NEW - Task tracking document |
+| `src/cab_evaluation/agents/tool_agent.py` | **NEW** - Tool-based agent replicating Strands functionality |
+| `src/cab_evaluation/agents/strands_agent.py` | Integration of Tool Agent as Strands fallback |
+| `src/cab_evaluation/agents/azure_endpoint_router.py` | **NEW** - Multi-endpoint load balancer for Azure OpenAI |
+| `src/cab_evaluation/utils/rich_logger.py` | Enhanced logging with Rich panels |
+| `src/cab_evaluation/cli.py` | Added concurrency, Rich progress bars, structured logging |
+| `src/cab_evaluation/workflows/generation_workflow.py` | Integrated rich_logger, repo_dir passing |
+| `requirements.txt` | Added azure-identity, azure-keyvault-secrets, rich, tenacity |
+| `test_azure_config.py` | **NEW** - Test script for Azure configuration with Key Vault support |
+| `results/cab_viewer_clean.html` | **NEW** - Anthropic-inspired results viewer |
+| `docs/STRANDS_ANALYSIS.md` | **NEW** - Strands vs Tool Agent analysis |
+| `docs/AZURE_OPENAI_PIPELINE.md` | **NEW** - Pipeline documentation |
+| `docs/RUN_COMMANDS.md` | **NEW** - Commands to run evaluation |
+| `TODO.md` | Task tracking document |

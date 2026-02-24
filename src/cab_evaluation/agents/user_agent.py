@@ -136,7 +136,7 @@ class UserAgent(StrandsAgent):
         Returns:
             Dictionary with response, satisfaction_status, and satisfaction_reason
         """
-        self.logger.info("Activating user agent to respond to maintainer")
+        self.logger.debug("User agent responding")
         
         # Create system prompt with context
         system_prompt = self.get_system_prompt(
@@ -164,16 +164,15 @@ class UserAgent(StrandsAgent):
         """
         
         # Get user agent's response using Strands framework
-        self.logger.info("Requesting response from user agent")
+        self.logger.debug("Requesting user agent response")
         full_response = await super().generate_response(user_prompt, system_prompt, issue_data.id)
-        self.logger.info(f"User agent response complete ({len(full_response)} chars)")
+        self.logger.debug(f"User response: {len(full_response)} chars")
         
         # Parse satisfaction status
         satisfaction_result = self._parse_satisfaction_status(full_response)
         
-        # Log satisfaction status
-        self.logger.info(f"User satisfaction status: {satisfaction_result['satisfaction_status']}")
-        self.logger.info(f"Satisfaction reason: {satisfaction_result['satisfaction_reason']}")
+        # Log satisfaction status at DEBUG
+        self.logger.debug(f"User status: {satisfaction_result['satisfaction_status']}")
         
         return satisfaction_result
     

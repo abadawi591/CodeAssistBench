@@ -232,16 +232,16 @@ class RepositoryManager:
             RepositoryError: If cloning fails after all retries
         """
         temp_dir = tempfile.mkdtemp()
-        logger.info(f"Created temporary directory: {temp_dir}")
+        logger.debug(f"Temp dir: {temp_dir}")
         
         # Extract repo name from URL
         repo_name = self.parse_repo_name(repo_url)
-        logger.info(f"Cloning repository: {repo_name}")
+        logger.debug(f"Cloning: {repo_name}")
         
         for attempt in range(self.max_retries + 1):
             try:
                 if attempt > 0:
-                    logger.info(f"Retry attempt {attempt}/{self.max_retries} for cloning {repo_name}")
+                    logger.debug(f"Clone retry {attempt}/{self.max_retries}")
                     
                     # Clean up previous failed attempt
                     if os.path.exists(temp_dir):
@@ -252,7 +252,7 @@ class RepositoryManager:
                             logger.warning(f"Failed to clean up directory: {e}")
                             temp_dir = tempfile.mkdtemp()
                 
-                logger.info(f"Initial shallow clone of {repo_name} (attempt {attempt+1}/{self.max_retries+1})")
+                logger.debug(f"Shallow clone attempt {attempt+1}")
                 clone_result = subprocess.run(
                     ["git", "clone", "--quiet", "--depth=1", repo_name, temp_dir],
                     check=True,
@@ -262,7 +262,7 @@ class RepositoryManager:
                 )
 
                 # Fetch the specific commit
-                logger.info(f"Fetching specific commit: {commit_hash}")
+                logger.debug(f"Fetching commit: {commit_hash[:8]}")
                 fetch_result = subprocess.run(
                     ["git", "fetch", "--quiet", "--depth=1", "origin", commit_hash],
                     cwd=temp_dir,
@@ -273,7 +273,7 @@ class RepositoryManager:
                 )
 
                 # Checkout the commit
-                logger.info(f"Checking out commit: {commit_hash}")
+                logger.debug(f"Checkout: {commit_hash[:8]}")
                 checkout_result = subprocess.run(
                     ["git", "checkout", "--quiet", commit_hash],
                     cwd=temp_dir,
@@ -283,7 +283,7 @@ class RepositoryManager:
                     timeout=60
                 )
                 
-                logger.info(f"Successfully cloned repository at commit {commit_hash}")
+                logger.debug(f"Cloned at {commit_hash[:8]}")
                 return temp_dir
                 
             except subprocess.TimeoutExpired as e:

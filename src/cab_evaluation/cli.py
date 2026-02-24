@@ -11,32 +11,79 @@ from typing import Optional
 
 from tqdm import tqdm
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, TimeElapsedColumn
+from rich.text import Text
 from rich.live import Live
 from rich.console import Group
 from rich.panel import Panel
 
 from .core.config import CABConfig
+from .core.exceptions import AgentCorruptedError
 from .utils.data_processor import DataProcessor
 from .utils.rich_logger import CABLogger, get_cab_logger, console
 from .workflows.cab_workflow import CABWorkflow
 
 
 def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None):
-    """Setup logging configuration.
+    """Setup logging configuration with rich formatting.
     
     Args:
         log_level: Logging level
         log_file: Optional log file path
     """
-    handlers = [logging.StreamHandler()]
+    from rich.logging import RichHandler
+    
+    # Use RichHandler for beautiful console output
+    handlers = [
+        RichHandler(
+            console=console,
+            show_time=True,
+            show_path=False,
+            markup=True,
+            rich_tracebacks=True,
+            log_time_format="[%H:%M:%S]"
+        )
+    ]
+    
     if log_file:
-        handlers.append(logging.FileHandler(log_file))
+        # Plain file handler (no rich formatting)
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+        ))
+        handlers.append(file_handler)
     
     logging.basicConfig(
         level=getattr(logging, log_level.upper()),
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        handlers=handlers
+        format="%(message)s",
+        handlers=handlers,
+        force=True  # Override any existing configuration
     )
+    
+    # Suppress noisy third-party loggers
+    noisy_loggers = [
+        "azure",
+        "azure.core",
+        "azure.core.pipeline",
+        "azure.core.pipeline.policies",
+        "azure.identity",
+        "azure.identity._credentials",
+        "openai",
+        "openai._base_client",
+        "httpx",
+        "httpcore",
+        "urllib3",
+        "urllib3.connectionpool",
+        "asyncio",
+        "charset_normalizer",
+        "filelock",
+        "msal",
+        "strands",
+        "strands.agent",
+        "strands.models",
+        "strands_tools",
+    ]
+    for logger_name in noisy_loggers:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 async def run_dataset(args):
@@ -73,7 +120,7 @@ async def run_dataset(args):
     if hasattr(args, 'agent_framework') and args.agent_framework:
         try:
             agent_framework_mapping = json.loads(args.agent_framework)
-            logger.info(f"Using agent frameworks: {agent_framework_mapping}")
+            logger.debug(f"Agent frameworks: {agent_framework_mapping}")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in agent_framework: {e}")
             return 1
@@ -134,7 +181,7 @@ async def run_generation_dataset(args):
     if hasattr(args, 'agent_framework') and args.agent_framework:
         try:
             agent_framework_mapping = json.loads(args.agent_framework)
-            logger.info(f"Using agent frameworks: {agent_framework_mapping}")
+            logger.debug(f"Agent frameworks: {agent_framework_mapping}")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in agent_framework: {e}")
             return 1
@@ -164,6 +211,24 @@ async def run_generation_dataset(args):
         if args.language:
             raw_data = [item for item in raw_data if item.get('language', '').lower() == args.language.lower()]
             logger.info(f"Filtered to {len(raw_data)} issues for language: {args.language}")
+        
+        # Filter by classification category if specified
+        if hasattr(args, 'category') and args.category:
+            raw_data = [
+                item for item in raw_data 
+                if item.get('_classification', {}).get('category', '').lower() == args.category.lower()
+            ]
+            logger.info(f"Filtered to {len(raw_data)} issues for category: {args.category}")
+        
+        # Filter out Docker issues if --no-docker flag is set
+        if hasattr(args, 'no_docker') and args.no_docker:
+            raw_data = [item for item in raw_data if item.get('dockerfile') is None]
+            logger.info(f"Filtered to {len(raw_data)} non-Docker issues")
+        
+        # Filter to only Docker issues if --has-dockerfile flag is set
+        if hasattr(args, 'has_dockerfile') and args.has_dockerfile:
+            raw_data = [item for item in raw_data if item.get('dockerfile') is not None]
+            logger.info(f"Filtered to {len(raw_data)} Docker issues")
         
         # Convert to IssueData objects
         issues = []
@@ -199,7 +264,13 @@ async def run_generation_dataset(args):
     
     # Filter out already processed issues
     issues_to_process = [issue for issue in issues if issue.id not in processed_issues]
-    logger.info(f"Processing {len(issues_to_process)} issues (total: {len(issues)})")
+    
+    # Apply limit if specified
+    if hasattr(args, 'limit') and args.limit is not None:
+        issues_to_process = issues_to_process[:args.limit]
+        logger.info(f"Processing {len(issues_to_process)} issues (limited from {len(issues) - len(processed_issues)})")
+    else:
+        logger.info(f"Processing {len(issues_to_process)} issues (total: {len(issues)})")
     
     # Process issues and write results to JSONL
     try:
@@ -223,27 +294,169 @@ async def run_generation_dataset(args):
         cab_logger.info(f"Output file: {args.output}")
         cab_logger.info(f"Log file: {log_file_path}")
         
+        # Warm up Azure config cache (avoids concurrent Key Vault lookups)
+        if agent_model_mapping:
+            maintainer_model = agent_model_mapping.get("maintainer", "gpt-5.2")
+            if "gpt-5" in maintainer_model.lower() or "gpt5" in maintainer_model.lower():
+                logger.info("Pre-caching Azure OpenAI configuration...")
+                from .agents.strands_agent import StrandsAgent
+                warmup_agent = StrandsAgent(model_name=maintainer_model, config=config)
+                warmup_agent._get_azure_openai_config(maintainer_model)
+                logger.info("Azure config cached. Ready for parallel processing.")
+        
         # Open output file for appending (for resume functionality)
         mode = 'a' if (args.resume and Path(args.output).exists()) else 'w'
         output_file = open(args.output, mode)
         
-        # Rich progress bar - stays visible at top
+        # Track active and completed issues
+        # status can be: "cloning", "exploring", "user", "maintainer", "done"
+        active_issues = {}  # {issue_id: {"title": str, "turn": int, "status": str, "phase": str, "start_time": float}}
+        completed_issues = []  # List of {"issue_id": str, "title": str, "result": str, "turns": int, "duration": int}
+        active_issues_lock = threading.Lock()
+        
+        def update_issue_progress(issue_id: str, title: str, turn: int, status: str = "processing", phase: str = None, result: str = None):
+            """Update the progress for a specific issue."""
+            with active_issues_lock:
+                short_title = title[:50] + "..." if len(title) > 50 else title
+                
+                if status == "done":
+                    # Move to completed list
+                    if issue_id in active_issues:
+                        issue_info = active_issues.pop(issue_id)
+                        duration = int(time.time() - issue_info.get('start_time', time.time()))
+                        completed_issues.append({
+                            "issue_id": issue_id,
+                            "title": short_title,
+                            "result": result or "✓",
+                            "turns": turn,
+                            "duration": duration
+                        })
+                        # Keep only last 20 completed issues visible
+                        while len(completed_issues) > 20:
+                            completed_issues.pop(0)
+                else:
+                    if issue_id not in active_issues:
+                        active_issues[issue_id] = {
+                            "title": short_title, 
+                            "turn": turn, 
+                            "status": status, 
+                            "phase": phase or status,
+                            "start_time": time.time()
+                        }
+                    else:
+                        update = {"title": short_title, "turn": turn, "status": status}
+                        if phase:
+                            update["phase"] = phase
+                        active_issues[issue_id].update(update)
+        
+        def render_active_issues_table():
+            """Render completed + active issues as a table."""
+            from rich.table import Table
+            
+            with active_issues_lock:
+                if not active_issues and not completed_issues:
+                    return Text("Waiting for issues...", style="dim")
+                
+                table = Table(show_header=False, box=None, padding=(0, 1), collapse_padding=True)
+                table.add_column("Issue", style="dim cyan", width=8)
+                table.add_column("Status", style="bold", width=22)
+                table.add_column("Title", style="white", overflow="ellipsis", max_width=50)
+                table.add_column("Time", style="dim", width=8)
+                
+                # Show completed issues first (most recent at bottom)
+                for completed in completed_issues:
+                    result = completed.get('result', '✗')
+                    # Map satisfaction status to display
+                    if result == "FULLY_SATISFIED":
+                        result_display = "[green]✓ SATISFIED[/green]"
+                    elif result == "PARTIALLY_SATISFIED":
+                        result_display = "[yellow]◐ PARTIAL[/yellow]"
+                    elif result == "NOT_SATISFIED":
+                        result_display = "[red]✗ NOT_SAT[/red]"
+                    elif result == "AGENT_ERROR":
+                        result_display = "[magenta]⚠ AGENT_ERR[/magenta]"
+                    elif result == "✓":
+                        result_display = "[green]✓ Done[/green]"
+                    else:
+                        result_display = "[red]✗ ERROR[/red]"
+                    status_display = f"{result_display} T{completed['turns']}"
+                    table.add_row(
+                        f"[dim]#{completed['issue_id']}[/dim]",
+                        f"[dim]{status_display}[/dim]",
+                        f"[dim]{completed['title']}[/dim]",
+                        f"[dim]{completed['duration']}s[/dim]"
+                    )
+                
+                # Add separator if we have both completed and active
+                if completed_issues and active_issues:
+                    table.add_row("", "[dim]─────────────[/dim]", "", "")
+                
+                # Show ALL active issues
+                for issue_id, info in list(active_issues.items()):
+                    turn_num = info['turn']
+                    status = info['status']
+                    phase = info.get('phase', status)
+                    elapsed = int(time.time() - info.get('start_time', time.time()))
+                    
+                    # Phase/Turn display
+                    if phase == "init":
+                        phase_display = "[dim]🔧 Init...[/dim]"
+                    elif phase == "cloning":
+                        phase_display = "[cyan]📦 Cloning...[/cyan]"
+                    elif phase and phase.startswith("explore_"):
+                        iter_num = phase.split("_")[1]
+                        phase_display = f"[magenta]🔍 Explore {iter_num}/5[/magenta]"
+                    elif phase == "exploring":
+                        phase_display = "[magenta]🔍 Exploring[/magenta]"
+                    elif phase == "commit":
+                        phase_display = "[blue]🔗 Commit[/blue]"
+                    elif status == "user":
+                        phase_display = f"[yellow]👤 Turn {turn_num}[/yellow]"
+                    elif status == "maintainer":
+                        phase_display = f"[green]🤖 Turn {turn_num}[/green]"
+                    elif turn_num > 0:
+                        phase_display = f"[dim]Turn {turn_num}[/dim]"
+                    else:
+                        phase_display = f"[dim]⏳ {phase}[/dim]"
+                    
+                    time_display = f"{elapsed}s"
+                    
+                    table.add_row(f"#{issue_id}", phase_display, info['title'], time_display)
+                
+                return table
+        
+        # Main progress bar (simple, one line)
         progress = Progress(
             SpinnerColumn(),
             TextColumn(f"[bold cyan]Generation (×{concurrency})[/bold cyan]"),
             BarColumn(bar_width=40),
             TaskProgressColumn(),
+            TextColumn("[green]✓{task.fields[success]}[/green] [red]✗{task.fields[failed]}[/red]"),
             TextColumn("•"),
             TimeElapsedColumn(),
             TextColumn("•"),
             TimeRemainingColumn(),
-            TextColumn("[green]✓{task.fields[success]}[/green] [red]✗{task.fields[failed]}[/red]"),
             console=console,
             expand=False,
         )
         
-        # Start progress display
-        progress.start()
+        # Create a combined display with progress bar and active issues table
+        from rich.table import Table as RichTable
+        
+        class CombinedDisplay:
+            """Combined display with progress bar and active issues."""
+            def __rich__(self):
+                from rich.console import Group as RichGroup
+                return RichGroup(
+                    progress,
+                    Text(""),  # Spacer
+                    render_active_issues_table()
+                )
+        
+        combined = CombinedDisplay()
+        live = Live(combined, console=console, refresh_per_second=2, transient=False)
+        live.start()
+        
         task_id = progress.add_task("processing", total=len(issues_to_process), success=0, failed=0)
         
         async def process_single_issue(issue_data, issue_index):
@@ -252,24 +465,26 @@ async def run_generation_dataset(args):
             
             async with semaphore:
                 issue_start_time = time.time()
+                issue_id_str = str(issue_data.id)
+                
+                # Update progress to show this issue starting
+                update_issue_progress(issue_id_str, issue_data.first_question.title, 0, "starting", "queued")
                 
                 try:
-                    # Log issue start with rich formatting
-                    cab_logger.issue_start(
-                        issue_id=str(issue_data.id),
-                        title=issue_data.first_question.title,
-                        language=issue_data.language,
-                        repository=issue_data.commit_info.repository,
-                        issue_number=issue_index + 1,
-                        total_issues=len(issues_to_process)
-                    )
+                    # Define progress callback for phase and turn updates
+                    def on_progress_update(turn_num: int = 0, role: str = None, phase: str = None):
+                        """Callback for progress updates. Can be called with just phase, or with turn+role."""
+                        status = role if role else (phase if phase else "processing")
+                        update_issue_progress(issue_id_str, issue_data.first_question.title, turn_num, status, phase)
                     
-                    # Run generation workflow
+                    # Run generation workflow with progress callback
                     result = await generation_workflow.run_generation(
                         issue_data, 
                         agent_model_mapping, 
                         agent_framework_mapping,
-                        enable_ast_tools=not getattr(args, 'disable_ast_tools', False)
+                        enable_ast_tools=not getattr(args, 'disable_ast_tools', False),
+                        rich_logger=cab_logger,
+                        progress_callback=on_progress_update
                     )
                     
                     # Get original issue data
@@ -278,6 +493,9 @@ async def run_generation_dataset(args):
                         if str(orig_item.get('number')) == str(result.issue_data.id):
                             original_issue = orig_item
                             break
+                    
+                    # Calculate issue duration
+                    issue_duration = time.time() - issue_start_time
                     
                     # Convert to dictionary
                     result_dict = {
@@ -302,6 +520,7 @@ async def run_generation_dataset(args):
                         'exploration_log': result.exploration_log,
                         'llm_call_counter': result.llm_call_counter,
                         'prompt_cache': result.prompt_cache,
+                        'duration_seconds': issue_duration,
                         'original_metadata': original_issue if original_issue else {},
                         'processing_metadata': {
                             'workflow': 'generation_only',
@@ -320,21 +539,79 @@ async def run_generation_dataset(args):
                         successful_count += 1
                         progress.update(task_id, advance=1, success=successful_count, failed=failed_count)
                     
-                    # Log issue completion with rich formatting
-                    issue_duration = time.time() - issue_start_time
-                    cab_logger.issue_complete(
+                    # Mark as completed with satisfaction status
+                    satisfaction_result = result.satisfaction_status.value if result.satisfaction_status else "FULLY_SATISFIED"
+                    update_issue_progress(issue_id_str, issue_data.first_question.title, result.total_conversation_rounds, "done", result=satisfaction_result)
+                    
+                    # Log issue completion with conversation summary
+                    cab_logger.issue_complete_with_conversation(
                         issue_id=str(issue_data.id),
+                        title=issue_data.first_question.title,
                         success=True,
                         satisfaction_status=result.satisfaction_status.value,
                         total_turns=result.total_conversation_rounds,
-                        duration_seconds=issue_duration
+                        duration_seconds=issue_duration,
+                        conversation_history=result.conversation_history
                     )
                     
                     return result_dict
                     
+                except AgentCorruptedError as e:
+                    # Agent corruption is a specific failure type (Strands bug)
+                    error_duration = time.time() - issue_start_time
+                    cab_logger.error(f"Agent corrupted: {e}", issue_id=str(issue_data.id))
+                    
+                    # Mark as completed with AGENT_ERROR status
+                    update_issue_progress(issue_id_str, issue_data.first_question.title, 0, "done", result="AGENT_ERROR")
+                    
+                    with write_lock:
+                        failed_count += 1
+                        progress.update(task_id, advance=1, success=successful_count, failed=failed_count)
+                    
+                    # Write error result with AGENT_ERROR status
+                    original_issue = None
+                    for orig_item in raw_data:
+                        if str(orig_item.get('number')) == str(issue_data.id):
+                            original_issue = orig_item
+                            break
+                    
+                    error_result = {
+                        'issue_id': issue_data.id,
+                        'question_title': issue_data.first_question.title,
+                        'question_body': issue_data.first_question.body,
+                        'user': issue_data.first_question.user,
+                        'language': issue_data.language,
+                        'repository': issue_data.commit_info.repository,
+                        'commit_sha': issue_data.commit_info.sha,
+                        'error': str(e),
+                        'user_satisfied': False,
+                        'satisfaction_status': 'AGENT_ERROR',
+                        'satisfaction_reason': f'Agent corrupted: {str(e)}',
+                        'total_conversation_rounds': 0,
+                        'duration_seconds': error_duration,
+                        'original_metadata': original_issue if original_issue else {},
+                        'processing_metadata': {
+                            'workflow': 'generation_only',
+                            'timestamp': datetime.now().isoformat(),
+                            'error_occurred': True,
+                            'error_type': 'agent_corrupted',
+                            'error_message': str(e),
+                            'input_file': args.dataset_file
+                        }
+                    }
+                    with write_lock:
+                        output_file.write(json.dumps(error_result, default=str) + '\n')
+                        output_file.flush()
+                    
+                    return error_result
+                    
                 except Exception as e:
                     # Log error with rich formatting
+                    error_duration = time.time() - issue_start_time
                     cab_logger.error(str(e), issue_id=str(issue_data.id))
+                    
+                    # Mark as completed (failure/error)
+                    update_issue_progress(issue_id_str, issue_data.first_question.title, 0, "done", result="ERROR")
                     
                     with write_lock:
                         failed_count += 1
@@ -360,6 +637,7 @@ async def run_generation_dataset(args):
                         'satisfaction_status': 'ERROR',
                         'satisfaction_reason': f'Processing failed: {str(e)}',
                         'total_conversation_rounds': 0,
+                        'duration_seconds': error_duration,
                         'original_metadata': original_issue if original_issue else {},
                         'processing_metadata': {
                             'workflow': 'generation_only',
@@ -382,21 +660,73 @@ async def run_generation_dataset(args):
         ]
         
         # Run all tasks with controlled concurrency (via semaphore)
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Clean up
-        progress.stop()
+        live.stop()
         output_file.close()
         
         # Calculate total duration
         total_duration = time.time() - start_time
+        
+        # Collect generation statistics from completed issues
+        generation_stats = {
+            'fully_satisfied': 0,
+            'partially_satisfied': 0,
+            'not_satisfied': 0,
+            'total_turns': 0,
+            'max_turns_reached': 0,
+            'count': 0,
+            'satisfaction_turns': []  # Track turns when satisfaction was achieved
+        }
+        
+        # Get max_turns from config (default 10)
+        max_turns = getattr(config, 'max_turns', 10) if config else 10
+        
+        for result in results:
+            if isinstance(result, dict) and 'satisfaction_status' in result:
+                generation_stats['count'] += 1
+                status = result.get('satisfaction_status', 'NOT_SATISFIED')
+                turns = result.get('total_conversation_rounds', 0)
+                
+                if status == 'FULLY_SATISFIED':
+                    generation_stats['fully_satisfied'] += 1
+                    # Track the turn at which satisfaction was achieved
+                    generation_stats['satisfaction_turns'].append(turns)
+                elif status == 'PARTIALLY_SATISFIED':
+                    generation_stats['partially_satisfied'] += 1
+                    generation_stats['satisfaction_turns'].append(turns)
+                else:  # NOT_SATISFIED or ERROR
+                    generation_stats['not_satisfied'] += 1
+                
+                generation_stats['total_turns'] += turns
+                
+                if turns >= max_turns:
+                    generation_stats['max_turns_reached'] += 1
+        
+        # Calculate averages and satisfaction turn stats
+        if generation_stats['count'] > 0:
+            generation_stats['avg_turns'] = generation_stats['total_turns'] / generation_stats['count']
+        
+        if generation_stats['satisfaction_turns']:
+            generation_stats['avg_satisfaction_turn'] = sum(generation_stats['satisfaction_turns']) / len(generation_stats['satisfaction_turns'])
+            generation_stats['min_satisfaction_turn'] = min(generation_stats['satisfaction_turns'])
+            generation_stats['max_satisfaction_turn'] = max(generation_stats['satisfaction_turns'])
+        
+        # Collect valid results for results log (filter out exceptions)
+        valid_results = [r for r in results if isinstance(r, dict) and 'satisfaction_status' in r]
+        
+        # Log all results in a formatted table
+        if valid_results:
+            cab_logger.results_log(valid_results)
         
         # Log final summary with rich formatting
         cab_logger.summary(
             total_issues=len(issues_to_process),
             successful=successful_count,
             failed=failed_count,
-            total_duration=total_duration
+            total_duration=total_duration,
+            generation_stats=generation_stats if generation_stats['count'] > 0 else None
         )
         
         cab_logger.info(f"Results saved to: {args.output}")
@@ -412,6 +742,9 @@ async def run_generation_dataset(args):
 async def run_evaluation_dataset(args):
     """Run evaluation workflow on JSONL generation results."""
     logger = logging.getLogger(__name__)
+    
+    # Track start time for duration calculation
+    start_time = time.time()
     
     # Load configuration
     config = None
@@ -723,12 +1056,151 @@ async def run_evaluation_dataset(args):
                     
                     failed_count += 1
         
-        # Log final summary
-        logger.info(f"=== EVALUATION DATASET PROCESSING COMPLETE ===")
-        logger.info(f"Total evaluations processed: {len(results_to_process)}")
-        logger.info(f"Successful: {successful_count}")
-        logger.info(f"Failed: {failed_count}")
-        logger.info(f"Results saved to: {args.output}")
+        # Calculate evaluation statistics
+        evaluation_stats = {
+            'correct': 0,
+            'partial': 0,
+            'incorrect': 0,
+            'total_alignment': 0,
+            'alignment_count': 0
+        }
+        
+        # Also collect generation stats from the input data
+        generation_stats = {
+            'fully_satisfied': 0,
+            'partially_satisfied': 0,
+            'not_satisfied': 0,
+            'total_turns': 0,
+            'max_turns_reached': 0,
+            'count': 0,
+            'satisfaction_turns': []
+        }
+        
+        # User-Judge agreement matrix
+        agreement_stats = {
+            'matrix': {
+                'sat_correct': 0, 'sat_partial': 0, 'sat_incorrect': 0,
+                'partial_correct': 0, 'partial_partial': 0, 'partial_incorrect': 0,
+                'notsat_correct': 0, 'notsat_partial': 0, 'notsat_incorrect': 0
+            },
+            'user_too_demanding': 0,  # NOT_SAT but CORRECT
+            'user_easily_fooled': 0,  # SAT but INCORRECT
+            'perfect_agreement': 0,   # Both agree (SAT+CORRECT or NOTSAT+INCORRECT)
+            'total': 0
+        }
+        
+        # Re-read results to collect statistics
+        try:
+            with open(args.output, 'r') as f:
+                for line in f:
+                    try:
+                        result = json.loads(line)
+                        
+                        # Evaluation stats
+                        verdict = result.get('verdict', '').upper()
+                        if verdict == 'CORRECT':
+                            evaluation_stats['correct'] += 1
+                        elif verdict == 'PARTIAL':
+                            evaluation_stats['partial'] += 1
+                        elif verdict in ['INCORRECT', 'ERROR']:
+                            evaluation_stats['incorrect'] += 1
+                        
+                        # Alignment score
+                        alignment = result.get('alignment_score', {})
+                        if isinstance(alignment, dict) and 'percentage' in alignment:
+                            evaluation_stats['total_alignment'] += alignment['percentage']
+                            evaluation_stats['alignment_count'] += 1
+                        
+                        # Generation stats from input
+                        gen_meta = result.get('generation_metadata', {})
+                        if gen_meta:
+                            generation_stats['count'] += 1
+                            status = gen_meta.get('satisfaction_status', 'NOT_SATISFIED')
+                            turns = gen_meta.get('total_conversation_rounds', 0)
+                            
+                            if status == 'FULLY_SATISFIED':
+                                generation_stats['fully_satisfied'] += 1
+                                generation_stats['satisfaction_turns'].append(turns)
+                            elif status == 'PARTIALLY_SATISFIED':
+                                generation_stats['partially_satisfied'] += 1
+                                generation_stats['satisfaction_turns'].append(turns)
+                            else:
+                                generation_stats['not_satisfied'] += 1
+                            
+                            generation_stats['total_turns'] += turns
+                            if turns >= 10:  # Default max turns
+                                generation_stats['max_turns_reached'] += 1
+                            
+                            # User-Judge agreement matrix
+                            agreement_stats['total'] += 1
+                            
+                            # Map user status to matrix key prefix
+                            if status == 'FULLY_SATISFIED':
+                                user_key = 'sat'
+                            elif status == 'PARTIALLY_SATISFIED':
+                                user_key = 'partial'
+                            else:
+                                user_key = 'notsat'
+                            
+                            # Map judge verdict to matrix key suffix
+                            if verdict == 'CORRECT':
+                                judge_key = 'correct'
+                            elif verdict == 'PARTIAL':
+                                judge_key = 'partial'
+                            else:
+                                judge_key = 'incorrect'
+                            
+                            matrix_key = f'{user_key}_{judge_key}'
+                            agreement_stats['matrix'][matrix_key] = agreement_stats['matrix'].get(matrix_key, 0) + 1
+                            
+                            # Calculate agreement insights
+                            # User too demanding: NOT_SAT but judge says CORRECT
+                            if status == 'NOT_SATISFIED' and verdict == 'CORRECT':
+                                agreement_stats['user_too_demanding'] += 1
+                            
+                            # User easily fooled: FULLY_SATISFIED but judge says INCORRECT
+                            if status == 'FULLY_SATISFIED' and verdict == 'INCORRECT':
+                                agreement_stats['user_easily_fooled'] += 1
+                            
+                            # Perfect agreement: both positive or both negative
+                            if (status == 'FULLY_SATISFIED' and verdict == 'CORRECT') or \
+                               (status == 'NOT_SATISFIED' and verdict == 'INCORRECT'):
+                                agreement_stats['perfect_agreement'] += 1
+                                
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            logger.warning(f"Could not collect statistics from output file: {e}")
+        
+        # Calculate averages
+        if evaluation_stats['alignment_count'] > 0:
+            evaluation_stats['avg_alignment'] = evaluation_stats['total_alignment'] / evaluation_stats['alignment_count']
+        
+        if generation_stats['count'] > 0:
+            generation_stats['avg_turns'] = generation_stats['total_turns'] / generation_stats['count']
+        
+        if generation_stats['satisfaction_turns']:
+            generation_stats['avg_satisfaction_turn'] = sum(generation_stats['satisfaction_turns']) / len(generation_stats['satisfaction_turns'])
+            generation_stats['min_satisfaction_turn'] = min(generation_stats['satisfaction_turns'])
+            generation_stats['max_satisfaction_turn'] = max(generation_stats['satisfaction_turns'])
+        
+        # Use rich logger for summary if available
+        from .utils.rich_logger import get_cab_logger
+        cab_logger = get_cab_logger()
+        
+        total_duration = time.time() - start_time
+        
+        cab_logger.summary(
+            total_issues=len(results_to_process),
+            successful=successful_count,
+            failed=failed_count,
+            total_duration=total_duration,
+            generation_stats=generation_stats if generation_stats['count'] > 0 else None,
+            evaluation_stats=evaluation_stats if (evaluation_stats['correct'] + evaluation_stats['partial'] + evaluation_stats['incorrect']) > 0 else None,
+            agreement_stats=agreement_stats if agreement_stats['total'] > 0 else None
+        )
+        
+        cab_logger.info(f"Results saved to: {args.output}")
         
         return 0
         
@@ -883,6 +1355,26 @@ def main():
         type=int,
         default=1,
         help="Number of issues to process concurrently (default: 1, recommended: 4-8 with multi-endpoint router)"
+    )
+    generation_dataset_parser.add_argument(
+        "--limit", "-n",
+        type=int,
+        default=None,
+        help="Limit the number of issues to process (default: process all)"
+    )
+    generation_dataset_parser.add_argument(
+        "--category",
+        help='Filter by classification category (e.g., "Does not need build environment")'
+    )
+    generation_dataset_parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Only process issues that don't require Docker (dockerfile is null)"
+    )
+    generation_dataset_parser.add_argument(
+        "--has-dockerfile",
+        action="store_true",
+        help="Only process issues that have a Dockerfile (require build environment)"
     )
     
     # Evaluation dataset command for JSONL files with generation results

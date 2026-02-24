@@ -136,7 +136,7 @@ class AzureEndpointRouter:
     # Health recovery settings
     FAILURE_THRESHOLD = 3  # Consecutive failures before marking unhealthy
     RECOVERY_TIME_SECONDS = 60  # Time before retrying unhealthy endpoint
-    RATE_LIMIT_BACKOFF_SECONDS = 30  # Time to back off after rate limit
+    RATE_LIMIT_BACKOFF_SECONDS = 65  # Time to back off after rate limit (Azure says 60s + buffer)
     
     def __init__(
         self,
@@ -168,9 +168,8 @@ class AzureEndpointRouter:
         self._failed_requests = 0
         self._failovers = 0
         
-        logger.info(f"Initialized Azure Endpoint Router with {len(self.endpoints)} endpoints")
-        logger.info(f"Total capacity: {sum(e.rpm_limit for e in self.endpoints):,} RPM, "
-                   f"{sum(e.tpm_limit for e in self.endpoints):,} TPM")
+        logger.debug(f"Azure Router: {len(self.endpoints)} endpoints, "
+                    f"{sum(e.rpm_limit for e in self.endpoints):,} RPM capacity")
     
     def _get_api_key_from_keyvault(self, secret_name: str) -> str:
         """Retrieve API key from Azure Key Vault with caching."""
@@ -186,7 +185,7 @@ class AzureEndpointRouter:
             secret = client.get_secret(secret_name)
             
             self._api_keys[secret_name] = secret.value
-            logger.info(f"Retrieved API key from Key Vault: {secret_name}")
+            logger.debug(f"Retrieved API key: {secret_name}")
             return secret.value
             
         except Exception as e:
@@ -205,7 +204,7 @@ class AzureEndpointRouter:
                 api_version=self.api_version,
                 azure_endpoint=endpoint.endpoint_url
             )
-            logger.info(f"Created client for endpoint: {endpoint.name}")
+            logger.debug(f"Created client: {endpoint.name}")
         
         return self._clients[cache_key]
     
@@ -224,14 +223,14 @@ class AzureEndpointRouter:
             if endpoint.status == EndpointStatus.RATE_LIMITED:
                 if current_time - endpoint.last_failure_time > self.RATE_LIMIT_BACKOFF_SECONDS:
                     endpoint.status = EndpointStatus.HEALTHY
-                    logger.info(f"Endpoint {endpoint.name} recovered from rate limit")
+                    logger.debug(f"Endpoint {endpoint.name} recovered from rate limit")
             
             # Check if unhealthy endpoint can be retried
             if endpoint.status == EndpointStatus.UNHEALTHY:
                 if current_time - endpoint.last_failure_time > self.RECOVERY_TIME_SECONDS:
                     endpoint.status = EndpointStatus.DEGRADED  # Try cautiously
                     endpoint.consecutive_failures = 0
-                    logger.info(f"Endpoint {endpoint.name} attempting recovery")
+                    logger.debug(f"Endpoint {endpoint.name} attempting recovery")
             
             # Reset request counter if minute has passed
             if current_time - endpoint.minute_start_time > 60:
@@ -265,7 +264,7 @@ class AzureEndpointRouter:
         
         if endpoint.status == EndpointStatus.DEGRADED:
             endpoint.status = EndpointStatus.HEALTHY
-            logger.info(f"Endpoint {endpoint.name} recovered to healthy")
+            logger.debug(f"Endpoint {endpoint.name} recovered to healthy")
         
         self._successful_requests += 1
     
@@ -276,10 +275,15 @@ class AzureEndpointRouter:
         
         error_str = str(error).lower()
         
-        # Check for rate limiting
-        if "rate" in error_str and "limit" in error_str:
+        # Check for rate limiting (comprehensive detection)
+        is_rate_limited = any(term in error_str for term in [
+            "429", "rate limit", "ratelimit", "ratelimitreached", 
+            "throttl", "too many requests", "quota", "capacity"
+        ])
+        
+        if is_rate_limited:
             endpoint.status = EndpointStatus.RATE_LIMITED
-            logger.warning(f"Endpoint {endpoint.name} rate limited")
+            logger.warning(f"Endpoint {endpoint.name} rate limited (429)")
         elif endpoint.consecutive_failures >= self.FAILURE_THRESHOLD:
             endpoint.status = EndpointStatus.UNHEALTHY
             logger.warning(f"Endpoint {endpoint.name} marked unhealthy after {endpoint.consecutive_failures} failures")
@@ -292,7 +296,8 @@ class AzureEndpointRouter:
         self,
         messages: List[Dict[str, str]],
         max_completion_tokens: int = 4096,
-        temperature: float = 0.1,
+        temperature: float = None,  # None = don't pass (for reasoning models)
+        reasoning_effort: str = None,  # For GPT-5.2 reasoning models
         max_attempts: int = 4,  # Try all 4 endpoints
         **kwargs
     ) -> str:
@@ -302,7 +307,8 @@ class AzureEndpointRouter:
         Args:
             messages: Chat messages
             max_completion_tokens: Max tokens in response
-            temperature: Sampling temperature
+            temperature: Sampling temperature (None for reasoning models)
+            reasoning_effort: Reasoning effort for GPT-5.2 (low/medium/high)
             max_attempts: Maximum number of endpoints to try
             **kwargs: Additional arguments for the API call
             
@@ -334,13 +340,21 @@ class AzureEndpointRouter:
                 
                 logger.debug(f"Attempting request on {endpoint.name} (attempt {attempt + 1}/{max_attempts})")
                 
-                response = await client.chat.completions.create(
-                    model=endpoint.deployment_name,
-                    messages=messages,
-                    max_completion_tokens=max_completion_tokens,
-                    temperature=temperature,
+                # Build API call params - only include temperature OR reasoning_effort, not both
+                api_params = {
+                    "model": endpoint.deployment_name,
+                    "messages": messages,
+                    "max_completion_tokens": max_completion_tokens,
                     **kwargs
-                )
+                }
+                
+                # For reasoning models (GPT-5.2), use reasoning_effort instead of temperature
+                if reasoning_effort is not None:
+                    api_params["reasoning_effort"] = reasoning_effort
+                elif temperature is not None:
+                    api_params["temperature"] = temperature
+                
+                response = await client.chat.completions.create(**api_params)
                 
                 self._handle_success(endpoint)
                 return response.choices[0].message.content
@@ -352,7 +366,7 @@ class AzureEndpointRouter:
                 
                 if attempt < max_attempts - 1:
                     self._failovers += 1
-                    logger.info(f"Failing over to another endpoint (attempt {attempt + 2}/{max_attempts})")
+                    logger.debug(f"Failover to another endpoint (attempt {attempt + 2}/{max_attempts})")
         
         # All endpoints failed
         raise last_error or Exception("All endpoints failed")
@@ -367,7 +381,8 @@ class AzureEndpointRouter:
         self,
         messages: List[Dict[str, str]],
         max_completion_tokens: int = 4096,
-        temperature: float = 0.1,
+        temperature: float = None,
+        reasoning_effort: str = None,
         **kwargs
     ) -> str:
         """
@@ -379,7 +394,8 @@ class AzureEndpointRouter:
         Args:
             messages: Chat messages
             max_completion_tokens: Max tokens in response  
-            temperature: Sampling temperature
+            temperature: Sampling temperature (None for reasoning models)
+            reasoning_effort: Reasoning effort for GPT-5.2 (low/medium/high)
             **kwargs: Additional arguments
             
         Returns:
@@ -389,6 +405,7 @@ class AzureEndpointRouter:
             messages=messages,
             max_completion_tokens=max_completion_tokens,
             temperature=temperature,
+            reasoning_effort=reasoning_effort,
             **kwargs
         )
     

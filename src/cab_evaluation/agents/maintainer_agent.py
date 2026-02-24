@@ -147,8 +147,9 @@ TOOL USAGE GUIDELINES:
         """
         
         # Get maintainer's response using Strands framework
+        # Pass repo_dir so Strands tools know where to explore
         response = await super().generate_response(
-            user_prompt, docker_system_prompt, issue_data.id
+            user_prompt, docker_system_prompt, issue_data.id, repo_dir=repo_dir
         )
         
         # Process file creation/modifications
@@ -245,8 +246,9 @@ TOOL USAGE GUIDELINES:
         """
         
         # Get maintainer response using Strands framework
+        # Pass repo_dir so Strands tools know where to explore
         maintainer_response = await super().generate_response(
-            user_prompt, system_prompt, issue_data.id
+            user_prompt, system_prompt, issue_data.id, repo_dir=repo_dir
         )
         
         # Process exploration commands
@@ -284,7 +286,7 @@ TOOL USAGE GUIDELINES:
                 """
                 
                 maintainer_response = await super().generate_response(
-                    final_prompt, system_prompt, issue_data.id
+                    final_prompt, system_prompt, issue_data.id, repo_dir=repo_dir
                 )
         
         return maintainer_response, exploration_results
@@ -311,7 +313,11 @@ TOOL USAGE GUIDELINES:
         """
         
         try:
-            response = await super().generate_response(user_prompt, system_prompt, issue_id="commit_selection")
+            # Use direct LLM call (not Strands/tool agent) to avoid polluting agent context
+            # This is a simple text decision that doesn't need tools
+            # Import BaseAgent's call_llm to bypass StrandsAgent's tool agent logic
+            from .base_agent import BaseAgent
+            response = await BaseAgent.call_llm(self, user_prompt, system_prompt, issue_id="commit_selection")
             response_text = response.strip()
             
             if "USE_REFERENCE_COMMIT" in response_text:
@@ -323,7 +329,7 @@ TOOL USAGE GUIDELINES:
                 
                 if hash_match:
                     user_commit = hash_match.group(0)
-                    self.logger.info(f"User specified commit detected: {user_commit}")
+                    self.logger.debug(f"User commit: {user_commit}")
                     return user_commit
                 else:
                     self.logger.warning(f"Unexpected response format. Using reference commit: {reference_commit}")

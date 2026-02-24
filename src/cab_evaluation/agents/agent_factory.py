@@ -37,7 +37,7 @@ class AgentFactory:
         model_name = model_name or self.config.default_maintainer_model
         
         if framework.lower() in ("kiro_cli", "kiro-cli", "kirocli", "qcli"):
-            logger.info("🤖 Creating Kiro CLI-based maintainer agent")
+            logger.debug("Creating Kiro CLI maintainer agent")
             try:
                 from .kiro_cli_maintainer_agent import KiroCLIMaintainerAgent
                 
@@ -51,11 +51,11 @@ class AgentFactory:
                 )
             except ImportError as e:
                 logger.error(f"❌ Kiro CLI agent import failed: {e}")
-                logger.info("🔄 Falling back to Strands framework")
+                logger.debug("Falling back to Strands framework")
                 framework = "strands"
         
         if framework.lower() == "openhands":
-            logger.info("🤖 Creating OpenHands-based maintainer agent")
+            logger.debug("Creating OpenHands maintainer agent")
             try:
                 from .openhands_maintainer_agent import OpenHandsMaintainerAgent
                 from ..utils.openhands_utils import map_cab_model_to_openhands
@@ -72,11 +72,11 @@ class AgentFactory:
                 )
             except ImportError as e:
                 logger.error(f"❌ OpenHands not available: {e}")
-                logger.info("📦 Install with: pip install openhands")
-                logger.info("🔄 Falling back to Strands framework")
+                logger.debug("Install with: pip install openhands")
+                logger.debug("Falling back to Strands framework")
                 framework = "strands"
         
-        logger.info("🤖 Creating Strands-based maintainer agent")
+        logger.debug("Creating Strands maintainer agent")
         return MaintainerAgent(
             model_name=model_name,
             config=self.config,
@@ -156,5 +156,5 @@ class AgentFactory:
             model_name = agent_model_mapping.get(agent_type)
             agents[agent_type] = self.create_agent(agent_type, model_name)
         
-        logger.info(f"Created agent set with model mapping: {agent_model_mapping}")
+        logger.debug(f"Created agent set: {agent_model_mapping}")
         return agents

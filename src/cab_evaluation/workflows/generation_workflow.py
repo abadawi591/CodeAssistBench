@@ -12,7 +12,7 @@ from ..core.models import (
     ExplorationResult
 )
 from ..core.config import CABConfig
-from ..core.exceptions import CABEvaluationError, InputTooLongError
+from ..core.exceptions import CABEvaluationError, InputTooLongError, AgentCorruptedError
 from ..agents.agent_factory import AgentFactory
 from ..utils.repository_manager import RepositoryManager, execute_command
 from ..utils.docker_manager import DockerManager
@@ -54,7 +54,9 @@ class GenerationWorkflow:
         agent_model_mapping: Optional[Dict[str, str]] = None,
         agent_framework_mapping: Optional[Dict[str, str]] = None,
         issue_logger: Optional[logging.Logger] = None,
-        enable_ast_tools: bool = True
+        enable_ast_tools: bool = True,
+        rich_logger: Optional[Any] = None,
+        progress_callback: Optional[callable] = None
     ) -> GenerationResult:
         """Run generation workflow for an issue.
         
@@ -65,6 +67,8 @@ class GenerationWorkflow:
                                     Example: {"maintainer": "openhands"}
             issue_logger: Optional dedicated logger for this issue
             enable_ast_tools: Enable AST tools for OpenHands agent (default: True)
+            rich_logger: Optional CABLogger for rich console output
+            progress_callback: Optional callback(turn_num, role) for progress updates
             
         Returns:
             GenerationResult with conversation and exploration data
@@ -72,8 +76,12 @@ class GenerationWorkflow:
         # Use issue logger if provided, otherwise use default logger
         log = issue_logger or logger
         
-        log.info(f"Starting generation workflow for issue: {issue_data.first_question.title}")
+        log.debug(f"Starting workflow: {issue_data.first_question.title}")
         self._flush_logger(log)
+        
+        # Report initialization phase early
+        if progress_callback:
+            progress_callback(0, None, "init")
         
         # Create agents with framework selection
         if agent_framework_mapping:
@@ -91,7 +99,7 @@ class GenerationWorkflow:
         # Track which framework is being used
         framework_used = agent_framework_mapping.get("maintainer", "strands") if agent_framework_mapping else "strands"
         is_openhands = framework_used == "openhands"
-        log.info(f"🤖 Maintainer agent framework: {framework_used}")
+        log.debug(f"Maintainer framework: {framework_used}")
         self._flush_logger(log)
         
         # Reset call counter for this issue
@@ -100,46 +108,63 @@ class GenerationWorkflow:
         # Clone repository for exploration
         repo_url = self.repository_manager.parse_repo_name(issue_data.commit_info.repository)
         
+        # Report commit selection phase
+        if progress_callback:
+            progress_callback(0, None, "commit")
+        
         # Let maintainer choose commit
         question = f"{issue_data.first_question.title}\n\n{issue_data.first_question.body}"
         selected_commit = await maintainer_agent.choose_commit(
             issue_data.commit_info.sha, question
         )
         
-        log.info(f"Selected commit for exploration: {selected_commit}")
+        log.debug(f"Commit: {selected_commit}")
         self._flush_logger(log)
+        
+        # Report cloning phase
+        if progress_callback:
+            progress_callback(0, None, "cloning")
         
         # Clone repository
         repo_dir = self.repository_manager.clone_repository(repo_url, selected_commit)
         if not repo_dir:
             raise CABEvaluationError(f"Failed to clone repository: {repo_url}")
         
+        # Set repo directory on maintainer agent for tool-based exploration
+        if hasattr(maintainer_agent, 'set_repo_dir'):
+            maintainer_agent.set_repo_dir(repo_dir)
+        
         # Detect if using Kiro CLI (also has native agentic loop)
         is_kiro_cli = hasattr(maintainer_agent, 'kiro_cli_path')
         
         try:
+            # Report exploration phase
+            if progress_callback:
+                progress_callback(0, None, "exploring")
+            
             # OpenHands and Kiro CLI have their own agentic loops, skip manual iteration
             if is_openhands:
-                log.info("Using OpenHands native agentic loop")
+                log.debug("Using OpenHands native agentic loop")
                 self._flush_logger(log)
                 initial_answer, exploration_history, exploration_log = await self._openhands_exploration(
                     repo_dir, question, maintainer_agent, issue_data.id, issue_logger
                 )
             elif is_kiro_cli:
-                log.info("Using Kiro CLI native agentic loop (single call)")
+                log.debug("Using Kiro CLI native agentic loop")
                 self._flush_logger(log)
                 initial_answer, exploration_history, exploration_log = await self._kiro_cli_exploration(
                     repo_dir, question, maintainer_agent, issue_data.id, issue_logger
                 )
             else:
                 # Perform interactive exploration for Strands agents (which need manual iteration)
-                log.info("Starting interactive exploration (Strands agent)")
+                log.debug("Starting interactive exploration")
                 self._flush_logger(log)
                 initial_answer, exploration_history, exploration_log = await self._interactive_exploration(
-                    repo_dir, question, maintainer_agent, issue_data.id, issue_logger
+                    repo_dir, question, maintainer_agent, issue_data.id, issue_logger,
+                    progress_callback=progress_callback
                 )
             
-            log.info(f"Exploration complete. Initial answer length: {len(initial_answer)}")
+            log.debug(f"Exploration complete: {len(initial_answer)} chars")
             self._flush_logger(log)
             
             # Initialize conversation history
@@ -157,7 +182,7 @@ class GenerationWorkflow:
             # Run Docker validation for initial answer if needed
             docker_results = None
             if issue_data.dockerfile:
-                log.info("Running initial Docker validation...")
+                log.debug("Running initial Docker validation")
                 self._flush_logger(log)
                 docker_results = await self._run_docker_validation(
                     issue_data, initial_answer, exploration_log, issue_logger
@@ -165,10 +190,10 @@ class GenerationWorkflow:
                 self._flush_logger(log)
             
             # Conduct conversation between agents
-            log.info("Starting agent conversation")
+            log.debug("Starting agent conversation")
             self._flush_logger(log)
             final_conversation, total_rounds, final_satisfaction = await self._conduct_conversation(
-                repo_dir, issue_data, conversation_history, maintainer_agent, user_agent, docker_results, exploration_log, issue_logger
+                repo_dir, issue_data, conversation_history, maintainer_agent, user_agent, docker_results, exploration_log, issue_logger, rich_logger, progress_callback
             )
             
             # Get final LLM call statistics
@@ -280,10 +305,7 @@ class GenerationWorkflow:
                 kiro_cli_metadata=kiro_cli_metadata
             )
             
-            log.info(f"Generation workflow complete for issue {issue_data.id}")
-            log.info(f"User satisfied: {result.user_satisfied}")
-            log.info(f"Total conversation rounds: {total_rounds}")
-            log.info(f"Total LLM calls: {sum(llm_call_stats.values())}")
+            log.debug(f"Workflow complete: {issue_data.id}, satisfied={result.user_satisfied}, rounds={total_rounds}")
             self._flush_logger(log)
             
             return result
@@ -434,7 +456,8 @@ class GenerationWorkflow:
         maintainer_agent,
         issue_id: str,
         issue_logger: Optional[logging.Logger] = None,
-        max_iterations: int = 5
+        max_iterations: int = 5,
+        progress_callback: Optional[callable] = None
     ) -> Tuple[str, List[str], str]:
         """Perform interactive repository exploration.
         
@@ -462,11 +485,15 @@ class GenerationWorkflow:
         # Detect if using Kiro CLI
         is_kiro_cli = hasattr(maintainer_agent, 'kiro_cli_path')
         
-        log.info(f"Starting interactive exploration with max {max_iterations} iterations (Kiro CLI: {is_kiro_cli})")
+        log.debug(f"Interactive exploration: {max_iterations} iterations")
         self._flush_logger(log)
         
         for iteration in range(max_iterations):
-            log.info(f"Exploration iteration {iteration+1}/{max_iterations}")
+            log.debug(f"Exploration iteration {iteration+1}/{max_iterations}")
+            
+            # Update progress to show exploration iteration
+            if progress_callback:
+                progress_callback(0, None, f"explore_{iteration+1}")
             
             # Create system prompt based on iteration and agent type
             if is_kiro_cli:
@@ -505,7 +532,7 @@ class GenerationWorkflow:
                     break
                 
                 exploration_history.append(exploration_plan)
-                log.info(f"Received exploration plan ({len(exploration_plan)} chars)")
+                log.debug(f"Exploration plan: {len(exploration_plan)} chars")
                 self._flush_logger(log)
                 
             except InputTooLongError:
@@ -514,6 +541,13 @@ class GenerationWorkflow:
                 break
             except Exception as e:
                 error_str = str(e).lower()
+                
+                # Check for Strands corrupted tool call history (unrecoverable - must raise exception)
+                if "strands_corrupted" in error_str or ("tool_call" in error_str and "did not have response" in error_str):
+                    log.error("⚠️ Strands agent corrupted (tool call history). Failing issue.")
+                    exploration_log += "\n--- EXPLORATION STOPPED: Strands agent corrupted ---\n"
+                    raise AgentCorruptedError("Maintainer agent tool call history corrupted during exploration", agent_type="maintainer")
+                
                 # Check for context length error in exception
                 if "max_tokens" in error_str or "max_completion_tokens" in error_str or "context length" in error_str:
                     log.warning("⚠️ Context length exceeded (exception). Stopping exploration to proceed to judge.")
@@ -541,12 +575,12 @@ class GenerationWorkflow:
                     if line.strip().startswith("EXPLORE:")
                 ]
                 
-                log.info(f"Executing {len(commands)} exploration commands")
+                log.debug(f"Executing {len(commands)} commands")
                 self._flush_logger(log)
                 
                 for i, cmd in enumerate(commands):
                     try:
-                        log.info(f"Executing command {i+1}/{len(commands)}: {cmd}")
+                        log.debug(f"Cmd {i+1}: {cmd[:50]}")
                         result = execute_command(repo_dir, cmd, timeout=self.config.workflow.command_timeout)
                         iteration_results += f"Command: {cmd}\nResult:\n{result}\n\n"
                     except Exception as e:
@@ -569,13 +603,13 @@ class GenerationWorkflow:
             
             # Check for answer
             if "ANSWER:" in exploration_plan:
-                log.info("Found ANSWER section. Extracting final answer.")
+                log.debug("Found ANSWER section")
                 self._flush_logger(log)
                 answer_part = exploration_plan.split("ANSWER:", 1)[1].strip()
                 return answer_part, exploration_history, exploration_log
         
         # Generate final answer if no explicit answer found
-        log.info("Generating final answer from exploration results")
+        log.debug("Generating final answer")
         self._flush_logger(log)
         final_system_prompt = maintainer_agent.get_system_prompt() + TaskPrompts.FINAL_ANSWER_GENERATION
         final_user_prompt = f"""
@@ -608,6 +642,12 @@ class GenerationWorkflow:
             return final_answer, exploration_history, exploration_log
         except Exception as e:
             error_str = str(e).lower()
+            
+            # Check for Strands corrupted tool call history (unrecoverable - must raise exception)
+            if "strands_corrupted" in error_str or ("tool_call" in error_str and "did not have response" in error_str):
+                log.error("⚠️ Strands agent corrupted in final answer. Failing issue.")
+                raise AgentCorruptedError("Maintainer agent tool call history corrupted during final answer", agent_type="maintainer")
+            
             # Check for context length error in exception
             if "max_tokens" in error_str or "max_completion_tokens" in error_str or "context length" in error_str:
                 log.warning("⚠️ Context length exceeded (exception) in final answer. Using fallback.")
@@ -626,7 +666,9 @@ class GenerationWorkflow:
         user_agent,
         initial_docker_results: Optional[Dict[str, Any]] = None,
         exploration_log: str = "",
-        issue_logger: Optional[logging.Logger] = None
+        issue_logger: Optional[logging.Logger] = None,
+        rich_logger: Optional[Any] = None,
+        progress_callback: Optional[callable] = None
     ) -> Tuple[List[ConversationMessage], int, Dict[str, Any]]:
         """Conduct conversation between user and maintainer agents.
         
@@ -639,6 +681,8 @@ class GenerationWorkflow:
             initial_docker_results: Initial Docker validation results
             exploration_log: Exploration log from initial exploration
             issue_logger: Optional dedicated logger for this issue
+            rich_logger: Optional CABLogger for rich console output
+            progress_callback: Optional callback(turn_num, role) for progress updates
             
         Returns:
             Tuple of (conversation_history, total_rounds, final_satisfaction_status)
@@ -656,10 +700,15 @@ class GenerationWorkflow:
         
         for round_num in range(max_rounds):
             if user_satisfied:
-                log.info("User is satisfied. Ending conversation.")
+                log.debug("User is satisfied. Ending conversation.")
                 break
-                
-            log.info(f"Starting conversation round {round_num + 1}/{max_rounds}")
+            
+            # Update progress callback for user turn
+            if progress_callback:
+                progress_callback(round_num + 1, "user", "conversation")
+            
+            # Don't log turns during processing - we'll show summary at end
+            log.debug(f"Conversation round {round_num + 1}/{max_rounds}")
             
             # User agent responds to maintainer
             try:
@@ -686,33 +735,54 @@ class GenerationWorkflow:
                     ConversationMessage(role="user", content=user_response)
                 )
                 
-                log.info(f"User response (round {round_num + 1}): {len(user_response)} chars")
-                log.info(f"Satisfaction status: {satisfaction_status}")
+                # Don't log during processing - summary shown at completion
+                log.debug(f"User: {len(user_response)} chars, status: {satisfaction_status}")
                 self._flush_logger(log)
                 
                 if user_satisfied:
-                    log.info("User is fully satisfied. Ending conversation.")
+                    log.debug("User is fully satisfied. Ending conversation.")
                     break
                     
             except InputTooLongError:
                 log.warning("Input too long error in user agent. Ending conversation.")
                 break
             except Exception as e:
+                error_str = str(e).lower()
+                
+                # Check for Strands corrupted tool call history (unrecoverable - must raise exception)
+                if "strands_corrupted" in error_str or ("tool_call" in error_str and "did not have response" in error_str):
+                    log.error("⚠️ Strands agent corrupted (tool call history) in user agent. Failing issue.")
+                    self._flush_logger(log)
+                    raise AgentCorruptedError("User agent tool call history corrupted", agent_type="user")
+                
+                # Check for rate limit errors - end conversation gracefully
+                is_rate_limit = any(term in error_str for term in [
+                    "429", "rate limit", "ratelimit", "throttl", "too many requests", "quota"
+                ])
+                if is_rate_limit:
+                    log.warning("⚠️ Rate limit error in user agent. Ending conversation gracefully.")
+                    self._flush_logger(log)
+                    break
+                
                 log.error(f"Error getting user agent response: {e}")
-                conversation_history.append(
-                    ConversationMessage(role="user", content=f"Error: Failed to get proper response. {str(e)}")
-                )
+                # For non-rate-limit errors, end conversation instead of adding error message
+                log.warning("Ending conversation due to user agent error.")
+                break
             
             # Early termination check
             if round_num == max_rounds - 1:
-                log.info(f"Reached maximum conversation rounds ({max_rounds}). Ending conversation.")
+                log.debug(f"Max rounds reached ({max_rounds})")
                 break
             
             # Maintainer agent responds
+            # Update progress callback for maintainer turn
+            if progress_callback:
+                progress_callback(round_num + 1, "maintainer", "conversation")
+            
             try:
                 if issue_data.dockerfile:
                     # Docker-aware response
-                    log.info("Using Docker-aware maintainer response")
+                    log.debug("Docker-aware response")
                     maintainer_response, extra_files, modified_dockerfile = await maintainer_agent.generate_docker_response(
                         repo_dir, issue_data, conversation_history, issue_logger=log
                     )
@@ -726,11 +796,11 @@ class GenerationWorkflow:
                     # Update issue data with modifications
                     if modified_dockerfile:
                         issue_data.dockerfile = modified_dockerfile
-                        log.info("Updated Dockerfile with maintainer's modifications")
+                        log.debug("Dockerfile updated")
                     
                     # Run Docker validation if changes were made
                     if extra_files or modified_dockerfile:
-                        log.info("Running Docker build with maintainer's changes")
+                        log.debug("Running Docker build")
                         docker_result = await self._run_docker_validation(
                             issue_data, maintainer_response, exploration_log, extra_files, issue_logger
                         )
@@ -764,9 +834,10 @@ class GenerationWorkflow:
                     # Add exploration to log (note: exploration_log is passed by reference)  
                     # We'll use a local variable to avoid parameter modification issues
                     if exploration_results:
-                        log.info(f"Conversation round {round_num + 1} exploration results logged")
+                        log.debug(f"Round {round_num + 1} exploration logged")
                 
-                log.info(f"Maintainer response (round {round_num + 1}): {len(maintainer_response)} chars")
+                # Don't log during processing - summary shown at completion
+                log.debug(f"Maintainer: {len(maintainer_response)} chars")
                 self._flush_logger(log)
                 
             except InputTooLongError:
@@ -774,18 +845,37 @@ class GenerationWorkflow:
                 break
             except Exception as e:
                 error_str = str(e).lower()
+                
+                # Check for Strands corrupted tool call history (unrecoverable - must raise exception)
+                if "strands_corrupted" in error_str or ("tool_call" in error_str and "did not have response" in error_str):
+                    log.error("⚠️ Strands agent corrupted (tool call history). Failing issue.")
+                    self._flush_logger(log)
+                    raise AgentCorruptedError("Maintainer agent tool call history corrupted", agent_type="maintainer")
+                
                 # Check for context length error in exception
                 if "max_tokens" in error_str or "max_completion_tokens" in error_str or "context length" in error_str:
                     log.warning("⚠️ Context length exceeded (exception). Ending conversation to proceed to judge.")
                     self._flush_logger(log)
                     break
+                
+                # Check for rate limit errors - end conversation gracefully instead of polluting with error messages
+                is_rate_limit = any(term in error_str for term in [
+                    "429", "rate limit", "ratelimit", "throttl", "too many requests", "quota"
+                ])
+                if is_rate_limit:
+                    log.warning("⚠️ Rate limit error persisted after retries. Ending conversation gracefully.")
+                    self._flush_logger(log)
+                    # Don't add error message to conversation - just end it
+                    break
+                
                 log.error(f"Error getting maintainer agent response: {e}")
+                # For non-rate-limit errors, add a generic error and continue
                 conversation_history.append(
-                    ConversationMessage(role="maintainer", content=f"Error: Failed to get proper response. {str(e)}")
+                    ConversationMessage(role="maintainer", content="I apologize, but I encountered a technical issue while processing your request. Let me try to help with what I know so far.")
                 )
         
         total_rounds = round_num + 1
-        log.info(f"Conversation completed after {total_rounds} rounds")
+        log.debug(f"Conversation done: {total_rounds} rounds")
         self._flush_logger(log)
         
         return conversation_history, total_rounds, final_satisfaction

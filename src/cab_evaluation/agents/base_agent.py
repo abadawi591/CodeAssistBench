@@ -99,11 +99,9 @@ class BaseAgent(ABC):
         """Increment LLM call counter for this agent and issue."""
         with call_counter_lock:
             llm_call_counter[issue_id][self.agent_type] += 1
+            # Counter tracked silently - visible in debug mode
             total_calls = sum(llm_call_counter[issue_id].values())
-            self.logger.info(
-                f"LLM Call #{total_calls} for issue {issue_id}: Agent {self.agent_type} "
-                f"(agent total: {llm_call_counter[issue_id][self.agent_type]})"
-            )
+            self.logger.debug(f"LLM call #{total_calls} for {issue_id}")
     
     def get_call_statistics(self, issue_id: str) -> Dict[str, int]:
         """Get LLM call statistics for an issue."""
@@ -145,15 +143,13 @@ class BaseAgent(ABC):
         # Increment counter
         self.increment_call_counter(issue_id)
         
-        # Log prompts
-        self.logger.info(f"===== SYSTEM PROMPT =====\n{system_prompt}\n")
-        self.logger.info(f"===== USER PROMPT =====\n{user_prompt}\n")
+        # Log prompts at DEBUG level (verbose)
+        self.logger.debug(f"System prompt ({len(system_prompt)} chars): {system_prompt[:200]}...")
+        self.logger.debug(f"User prompt ({len(user_prompt)} chars): {user_prompt[:200]}...")
         
         start_time = time.time()
-        self.logger.info(
-            f"Calling {self.model_config.name} model "
-            f"(prompt length: {len(user_prompt)}, agent: {self.agent_type}, issue: {issue_id})"
-        )
+        # LLM calls logged at DEBUG - summary shown at completion
+        self.logger.debug(f"LLM call: {self.agent_type} → {self.model_config.name}, {len(user_prompt):,} chars")
         
         try:
             response = await self.llm_service.call_model(
@@ -165,8 +161,8 @@ class BaseAgent(ABC):
             )
             
             elapsed_time = time.time() - start_time
-            self.logger.info(f"{self.model_config.name} model responded in {elapsed_time:.2f} seconds")
-            self.logger.info(f"===== LLM RESPONSE =====\n{response}\n")
+            self.logger.debug(f"Response: {elapsed_time:.1f}s, {len(response):,} chars")
+            self.logger.debug(f"Response preview: {response[:300]}...")
             
             return response
             
